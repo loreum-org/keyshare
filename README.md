@@ -14,7 +14,7 @@ One wallet API, with an MCP connector, that can read balances, send, swap, sign 
 
 **Human wallets.** The device share sits in the phone Secure Enclave or Android Keystore, behind a passkey or biometrics, with an encrypted backup. The user approves every signature on the device. Normal signing is the device plus one node.
 
-**Agent wallets.** Used by an owner's bots. The first deployment is Chad's bots (Loreum, FillTape, TeamShared). Shares are held by nodes, or one share is bot-held, plus the owner's offline backup. Each bot has its own policy and limits. A node contributes its share only after a ZK policy proof shows the transaction is allowed. A human wallet can also delegate limited, expiring, revocable authority to an agent.
+**Agent wallets.** Used by an owner's bots. The first deployment is Chad's bots (Loreum, FillTape, TeamShared). Shares are held by nodes, or one share is bot-held, plus the owner's offline backup. Each bot has its own policy and limits. Each signer node enforces the cap from its own counter; the nodes do not have to agree on one spend total before signing. In the bot-held layout only Node A is in the online quorum, so only Node A enforces the cap. A human wallet can also delegate limited, expiring, revocable authority to an agent.
 
 ## Owner-admin model
 
