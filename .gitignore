@@ -18,6 +18,9 @@ build/
 !.env.example
 *.pem
 *.key
+*.share
+*.keyshare
+keystore/
 
 # OS / editor
 .DS_Store
