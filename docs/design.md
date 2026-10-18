@@ -1,4 +1,4 @@
-# keyshare design (threshold signing + ZK policy)
+# keyshare design (threshold signing)
 
 **Owner:** Chad Lynch · **Org:** Loreum DAO · **Status:** Draft v0.1 (Oct 18, 2026) · **Audience:** internal
 
@@ -12,11 +12,11 @@ We want one **general-purpose wallet system with an MCP connector** that serves 
 - **Agent wallets:** used by an owner's bots. The first deployment is Chad's bots (Loreum, FillTape, TeamShared). The shares are held by nodes, or one is bot-held. Each bot gets **its own automated policy and limits**, and the owner holds an **offline backup share**. A human wallet can also **delegate limited authority** to an agent (§6.1a).
 - **Owner admin model:** every user is the admin of their own wallets, with M-of-N admins as an option for organizations, and Chamber can act as the admin. Node operators, including Loreum, enforce policy but can't change it (§15).
 
-The signing key is a **plain EOA**. Its address is derived from a **threshold key** that is created by distributed key generation (DKG), so **the full private key never exists anywhere**, not at creation and not at signing time. Every wallet is **2-of-3**. A human wallet's three shares are the device share plus two independent **signer nodes**. An agent wallet's three shares are two node shares, or one bot-held share plus one node share, plus the owner's offline backup share. Before a node contributes its share to an agent signature, it checks a **ZK policy proof** showing the transaction is allowed (allowlisted recipient/contract, under the bot's daily cap, requested by an authorized bot). In the bot-held layout only Node A is in the online quorum, so only Node A enforces that cap (§6.4). For a human wallet, the user's on-device approval is the main control and the nodes enforce baseline rules. If fewer than *t* parties agree, nothing gets signed.
+The signing key is a **plain EOA**. Its address is derived from a **threshold key** that is created by distributed key generation (DKG), so **the full private key never exists anywhere**, not at creation and not at signing time. Every wallet is **2-of-3**. A human wallet's three shares are the device share plus two independent **signer nodes**. An agent wallet's three shares are two node shares, or one bot-held share plus one node share, plus the owner's offline backup share. Before a node contributes its share to an agent signature, it rebuilds the transaction and enforces policy in **plain Rust**: recipient allowlist, per-tx and daily caps, authorized bot, and the kill switch (§6.2). There is no ZK proof in v1. The 2-of-3 threshold is what stops a single bad node. In the bot-held layout only Node A is in the online quorum, so only Node A enforces that cap (§6.4). For a human wallet, the user's on-device approval is the main control and the nodes enforce baseline rules. If fewer than *t* parties agree, nothing gets signed.
 
-This is the "virtual TEE" Chad asked about. It isn't built on plain Shamir sharing, because Shamir has to put the key back together to sign. It uses **threshold signatures (TSS) plus ZK proofs**, so trust rests on "fewer than *t* of *n* independent operators are compromised" rather than on a chip vendor's attestation.
+This is the "virtual TEE" Chad asked about. It isn't built on plain Shamir sharing, because Shamir has to put the key back together to sign. It uses **threshold signatures (TSS)**. Each signer runs the policy in plain Rust, so trust rests on "fewer than *t* of *n* independent operators are compromised" rather than on a chip vendor's attestation or on a proof system.
 
-**Recommended path:** Phase 0 testnet with a simple local signer → Phase 1 production on a vendor policy-enforced key (Turnkey, or Privy/CDP) behind the same MCP API → Phase 2 our own 2-of-3 TSS network with ZK policy proofs, no trusted vendor, and potentially packaged as part of **Chamber**.
+**Recommended path:** Phase 0 testnet with a simple local signer → Phase 1 production on a vendor policy-enforced key (Turnkey, or Privy/CDP) behind the same MCP API → Phase 2 our own 2-of-3 TSS network with plain-Rust policy, no trusted vendor, and potentially packaged as part of **Chamber**. ZK policy proofs are a later option (§6.5, Phase 5), not part of v1.
 
 ---
 
@@ -28,12 +28,12 @@ This is the "virtual TEE" Chad asked about. It isn't built on plain Shamir shari
 - **No single point of key compromise.** In the end state, no machine, person, or vendor ever holds the full key.
 - **Policy enforced at the signer, not in the caller.** A compromised bot, app, or MCP server can't produce a signature outside policy or without the user's approval.
 - **Simulate before sign.** Every state-changing request is dry-run first, and the result (asset deltas, recipient, approvals) is returned and logged.
-- **Fast enough for agents.** Normal transfers and calls finish in seconds (target, see §6.5).
+- **Fast enough for agents.** Normal transfers and calls finish in seconds. v1 has no proving step. Measured in Phase 2.
 - **Operable by a small team.** Kill switch, key-share rotation (resharing), revocation, and recovery are all documented and rehearsed.
 - **Multi-chain.** EVM (Ethereum, Base, Arbitrum) first. Hyperliquid through an agent/API wallet. Ed25519/Schnorr chains later via FROST.
 
 ### Non-goals
-- **No Safe / smart-account / multisig wrapper (deliberate decision).** Signing happens with a plain EOA, and every limit is enforced off-chain by the threshold signer nodes plus ZK policy proofs.
+- **No Safe / smart-account / multisig wrapper (deliberate decision).** Signing happens with a plain EOA, and every limit is enforced off-chain in plain Rust by the threshold signer nodes.
   - *What we gain:* works on every EVM chain and every dapp that expects an EOA (including Hyperliquid's EIP-712 signing). No contract deployment, no per-chain setup, no extra gas from a wrapper, no smart-contract audit surface, and simpler ops.
   - *What we give up:* there is **no on-chain backstop**. If *t* nodes are compromised or a policy bug lets a bad tx through, the chain will accept it. There's no on-chain spending limit, no time-lock, and no on-chain owner rotation. Rotating the EOA *address* means moving funds. Mitigations: keep balances small per wallet, use separate wallets per bot, run independent node operators, use resharing, and have the kill switch (§9).
 - Not a custody product for third-party funds (yet). That's a Chamber decision for later (§10).
@@ -46,11 +46,11 @@ This is the "virtual TEE" Chad asked about. It isn't built on plain Shamir shari
 | # | Threat | Example | Primary defense |
 |---|--------|---------|-----------------|
 | T1 | Compromised bot / prompt injection | A bot is tricked into "send all ETH to 0xattacker" | Per-bot policy enforced by signer nodes, allowlists, daily caps, and simulation. The bot can't change policy. |
-| T2 | Compromised MCP server / coordinator | Attacker controls the wallet connector on Railway | The coordinator holds **no key share**. Nodes verify the ZK proof and recompute the tx digest themselves, so a coordinator can't get an out-of-policy tx signed. It *can* still attempt key destruction or framing as a relay, see T12. |
-| T3 | Single signer node compromise | VPS breach on one node | Below threshold (1 of 3), the attacker learns nothing usable. Proactive resharing makes stolen shares stale, **but only if the suspect node is removed before any refresh** (§9.5, TOB-SILA-4). Cheating during signing triggers the ban rules (§9.7). A compromised node also cannot raise or erase another node's spend counter (§6.4). |
+| T2 | Compromised MCP server / coordinator | Attacker controls the wallet connector on Railway | The coordinator holds **no key share**. Each node rebuilds the transaction and runs the policy in plain Rust (§6.2), so a coordinator can't get an out-of-policy tx signed. It *can* still attempt key destruction or framing as a relay, see T12. |
+| T3 | Single signer node compromise | VPS breach on one node | Below threshold (1 of 3), the attacker learns nothing usable and cannot produce a signature alone. Policy is plain Rust on each node (§6.2); one bad node is not enough to sign. Proactive resharing makes stolen shares stale, **but only if the suspect node is removed before any refresh** (§9.5, TOB-SILA-4). Cheating during signing triggers the ban rules (§9.7). A compromised node also cannot raise or erase another node's spend counter (§6.4). |
 | T4 | *t* nodes compromised | Same cloud account or same admin holds 2 of 3 nodes | Independent hosting, operators, and credentials (§9.1). This is the residual risk we accept without an on-chain backstop. |
-| T5 | Policy / circuit bug | Circuit fails to constrain `to` or `value` | Audits, differential testing of the circuit against a plain-code policy checker, conservative caps, small balances. |
-| T6 | Blind-signing / digest mismatch | Coordinator sends a digest that doesn't match the tx it showed | Nodes **rebuild the signing hash from the raw tx/typed data** and bind it as a public input to the proof. They never sign a bare hash. |
+| T5 | Policy bug | The Rust checker fails to constrain `to` or `value` | Audits and tests of that checker, conservative caps, small balances. v1 does not rely on a circuit. |
+| T6 | Blind-signing / digest mismatch | Coordinator sends a digest that doesn't match the tx it showed | Nodes **rebuild the signing hash from the raw tx/typed data** and run policy on that transaction. They never sign a bare hash. |
 | T7 | Replay / double-spend of allowance, or rolling a spend counter back | The same approval reused to exceed the daily cap, or a node restored from an old disk snapshot | Each signer enforces its own hash-chained, monotonic counter (§6.4). Nodes do not have to agree on one counter before signing. The signed head is anchored off-node, and a node refuses to sign if its local head is behind the last known signed head. Chain nonces still apply. In bot-held share mode only Node A enforces the cap. A crash-fault log such as Raft is not the defense. |
 | T8 | Malicious typed data (Permit / Permit2 / setApprovalForAll) | "Just sign this message" that is actually an unlimited token approval | Typed-data decoding plus a deny list of dangerous primitives unless explicitly allowlisted. Approvals are capped by amount and expiry. |
 | T9 | Vendor risk (Phase 1) | Turnkey, Privy, or CDP outage, compromise, or policy change | An interim phase only, behind our own API so we can swap backends. Small balances. |
@@ -77,16 +77,15 @@ flowchart LR
   subgraph MCP["Wallet MCP connector (Railway)"]
     API[Tool API + caller auth<br/>human session / bot credential]
     SIM[Simulator<br/>eth_call / trace / Tenderly-style]
-    POL[Policy pre-check]
-    PRV[ZK prover]
+    POL[Policy pre-check<br/>fails fast, not enforcement]
     COORD[Signing coordinator<br/>holds NO key share]
     LOG[(Append-only audit log)]
   end
 
   subgraph Shares["Key shares (2-of-3 per wallet)"]
     DEV[Device share<br/>Secure Enclave / Keystore<br/>human wallets]
-    N1[Node A<br/>share + verifier + counters]
-    N2[Node B<br/>share + verifier + counters]
+    N1[Node A<br/>share + plain-Rust policy + counters]
+    N2[Node B<br/>share + plain-Rust policy + counters]
     BOTS[Bot-held share<br/>optional, agent wallets]
     COLD[Owner offline backup share<br/>agent wallets, offline]
   end
@@ -102,8 +101,8 @@ flowchart LR
   HU -->|request + on-device approval| API
   LB & FB & TB -->|MCP call + bot credential| API
   API --> SIM --> RPC
-  API --> POL --> PRV
-  PRV -->|tx, proof, public inputs| COORD
+  API --> POL --> COORD
+  COORD -->|raw tx| N1 & N2
   COORD <-->|TSS rounds DKLs23 / CGGMP| N1 & N2
   COORD <-->|TSS rounds after user approval| DEV
   COORD <-.->|agent wallets that hold a share| BOTS
@@ -123,12 +122,11 @@ flowchart LR
 **Request flow (state-changing call):**
 1. A caller invokes a tool, e.g. `send`. A bot uses its bot credential, and a human uses an app session bound to a passkey. The API authenticates the caller and resolves its `caller_id` (`bot_id` or `user_id`) and wallet.
 2. **Simulate.** The connector builds the exact tx (nonce, gas, chainId), simulates it, and extracts asset deltas, approvals, and touched contracts.
-3. **Policy pre-check** in plain code. It fails fast with a readable reason (for example "recipient not allowlisted for filltape").
-4. **Prove.** The prover generates a ZK proof that this exact tx satisfies the bot's policy against the committed policy root and **that node's** spend counter (§6). There is no shared spend root the nodes must match first.
-5. **Sign.** The coordinator sends `(raw tx, proof, public inputs)` to the nodes. Each node independently (a) rebuilds the signing digest from the raw tx, (b) checks that the digest matches the proof's public input, (c) verifies the proof, (d) checks its own view of the bot's spend counter, kill-switch flag, and request nonce, then (e) runs its part of the TSS signing round. With *t* honest approvals, a standard ECDSA signature comes out for the EOA.
-6. **Broadcast and log.** The signed tx is broadcast. Every step is appended to the audit log with `bot_id`, request id, simulation summary, proof hash, node approvals and refusals, and tx hash.
+3. **Policy pre-check** in the connector, in plain Rust. It fails fast with a readable reason (for example "recipient not allowlisted for filltape"). This is not what enforces policy. The nodes repeat the check.
+4. **Sign.** The coordinator sends the **raw tx** to the nodes. It does not send a proof. Each node independently (a) rebuilds the signing digest from the raw tx or typed data, (b) runs the §6.2 checks in plain Rust (allowlist, per-tx cap, daily cap against **its own** counter, authorized bot, kill switch, fresh nonce), then (c) runs its part of the TSS round. One node agreeing is not enough. With *t* approvals, a standard ECDSA signature comes out for the EOA.
+5. **Broadcast and log.** The signed tx is broadcast. Every step is appended to the audit log with `bot_id`, request id, simulation summary, policy version, node approvals and refusals, and tx hash.
 
-**Human wallets differ at step 5.** The connector sends the simulation summary (asset deltas, recipient, approvals) to the user's device. The user approves with biometrics or a passkey, and only then does the device share join the TSS round with one node. The node still checks its baseline rules (§6.1a). If the user doesn't approve, nothing is signed. **Agent wallets** sign automatically with two online shares (Node A + Node B, or bot share + Node A) once the policy proof verifies. In the bot-held layout only Node A enforces the cap (§6.4).
+**Human wallets differ at step 4.** The connector sends the simulation summary (asset deltas, recipient, approvals) to the user's device. The user approves with biometrics or a passkey, and only then does the device share join the TSS round with one node. The node still checks its baseline rules (§6.1a). If the user doesn't approve, nothing is signed. **Agent wallets** sign automatically with two online shares (Node A + Node B, or bot share + Node A) once each participating node accepts the plain-Rust check. In the bot-held layout only Node A enforces the cap (§6.4).
 
 Read-only tools (`address`, `balances`, `tx_status`, `simulate`) never reach the signers.
 
@@ -140,9 +138,9 @@ Read-only tools (`address`, `balances`, `tx_status`, `simulate`) never reach the
 |---|---|---|---|---|---|---|
 | **Raw key** (env var / KMS-stored secret) | One private key on a server | Yes, always | The server and anyone who can read the secret | Only in our app code, so a compromised app bypasses it | Fastest, trivial ops | Testnet only (Phase 0) |
 | **TEE / vendor (Turnkey, Privy, Coinbase CDP)** | Key lives and signs inside AWS Nitro enclaves. The vendor policy engine runs in the enclave | Yes, inside the enclave | Chip vendor attestation + the vendor's code and ops | Vendor policy engine (deny-by-default) | Fast. Turnkey advertises sub-100ms signing. Vendor-managed | Good interim (Phase 1) |
-| **MPC-TSS** (DKLs23, CGGMP21/24 for ECDSA; FROST for Schnorr/EdDSA) | DKG gives each node a share. Nodes jointly sign without reconstructing | **Never** | Fewer than *t* of *n* nodes compromised | Each node runs policy code before signing | Multi-round network protocol, we run the nodes | Strong core |
+| **MPC-TSS** (DKLs23, CGGMP21/24 for ECDSA; FROST for Schnorr/EdDSA) | DKG gives each node a share. Nodes jointly sign without reconstructing. Each node runs the policy in plain Rust first | **Never** | Fewer than *t* of *n* nodes compromised | Plain Rust on each signer before it contributes a share | Multi-round network protocol, we run the nodes | **v1 target (Phase 2)** |
 | **Shamir secret sharing (plain)** | The key is split into shares that are recombined to sign | Yes, at every signing | Whoever does the recombining | Wherever it's recombined | Simple, but recombination is a single point of failure | **Rejected** for signing. Fine for cold backup |
-| **TSS + ZK policy proofs (target)** | Same as MPC-TSS, plus every node verifies a succinct proof that the tx satisfies a committed policy | **Never** | Fewer than *t* of *n* nodes + soundness of the proof system and circuit | Cryptographic: nodes only check a proof against a committed root, and the rules are auditable | TSS rounds + proving time (§6.5) | **Phase 2 target** |
+| **TSS + ZK policy proofs** | Same as MPC-TSS, plus every node verifies a succinct proof that the tx satisfies a committed policy | **Never** | Fewer than *t* of *n* nodes + soundness of the proof system and circuit | Cryptographic: nodes check a proof instead of holding the rules | TSS rounds + proving time (§6.5) | **Later, optional (Phase 5). Not v1** |
 
 Verified notes on the products and libraries:
 - **Turnkey** runs key generation, signing, and its policy engine inside AWS Nitro Enclaves. Policies are JSON, deny-by-default, and can match on recipient, contract, function selector, chain id, and value. Note that a *root quorum bypasses policies*. Turnkey also offers "policy outcome proofs" of enclave decisions. ([docs](https://docs.turnkey.com/features/policies/overview), [enclaves](https://docs.turnkey.com/security/secure-enclaves))
@@ -152,7 +150,7 @@ Verified notes on the products and libraries:
 
 ---
 
-## 6. Policy engine and ZK circuit design
+## 6. Policy engine
 
 ### 6.1 Policy model (agent wallets, per bot)
 ```yaml
@@ -171,39 +169,31 @@ typed_data_allow: [HyperliquidSignTransaction, Permit2(bounded)]
 deny: [setApprovalForAll, unlimited approve, delegatecall targets]
 require_admin_cosign_above_usd: 1000   # owner admin key approves (M-of-N for org wallets), §15
 ```
-Policies live in a **replicated policy store**. Every version is hashed into a Merkle tree, and its root `R_policy` is what proofs reference. Only the wallet owner's admin authorization can change it (§15; M-of-N for organization wallets). **Loosening** a limit takes effect after a delay (for example 24h, to be decided). **Tightening** and the kill switch take effect immediately.
+Policies live in a **replicated policy store**. Every version is hashed into a Merkle tree, and its root `R_policy` is what each node loads. Only the wallet owner's admin authorization can change it (§15; M-of-N for organization wallets). **Loosening** a limit takes effect after a delay (for example 24h, to be decided). **Tightening** and the kill switch take effect immediately.
 
 ### 6.1a Human approval vs automated agent policy, and delegation
-- **Human wallets (user-approved signing).** No signature happens without the user's on-device approval: biometrics or a passkey unlocks the device share for that one request, and the approval screen shows the simulation result. The nodes enforce only a **baseline**: the deny list for dangerous typed data (§3 T8), the kill switch, recovery timelocks (§12.4), and optional user-set caps. The user's approval is the main control, and the ZK proof is not required for human-approved requests. The same Face ID approval **doubles as the owner's admin action** (§15.2).
-- **Agent wallets (automated policy).** Signing is automatic within the per-bot policy in §6.1, enforced by the nodes through the ZK policy proof (§6.2). There's no human in the loop, except `require_admin_cosign_above_usd` and other over-limit requests, which need the **owner's admin key** (§15.2).
+- **Human wallets (user-approved signing).** No signature happens without the user's on-device approval: biometrics or a passkey unlocks the device share for that one request, and the approval screen shows the simulation result. The nodes enforce only a **baseline**: the deny list for dangerous typed data (§3 T8), the kill switch, recovery timelocks (§12.4), and optional user-set caps. The user's approval is the main control. The nodes run that baseline in plain Rust. There is no ZK proof in v1. The same Face ID approval **doubles as the owner's admin action** (§15.2).
+- **Agent wallets (automated policy).** Signing is automatic within the per-bot policy in §6.1, enforced by each signer node in plain Rust (§6.2). One node is not enough to sign. There's no human in the loop, except `require_admin_cosign_above_usd` and other over-limit requests, which need the **owner's admin key** (§15.2).
 - **Delegation from a human wallet to an agent.** A human can give an agent **limited, expiring, revocable authority** with a **delegation grant**: an EIP-712 message signed by the human wallet that names `agent_id`, scope (chains, allowlist, selectors), `per_tx_cap`, `daily_cap`, and `expiry`. It's stored as a leaf in `R_policy`. Two forms:
   1. **Fund an agent wallet (default).** The human sends a budget to a separate agent wallet, and the grant sets that wallet's policy. The human wallet's own shares never sign for the agent, so the blast radius is limited to the budget.
   2. **Session grant on the human wallet (optional, small caps).** The two nodes may co-sign for the agent on the human wallet **within the grant only**, without the device. This is convenient, but it means the nodes can sign for that wallet within those limits, so keep caps small and expiry short.
   - Revocation happens through a signed `revoke_delegation` from the human device (immediate), the expiry, or the kill switch.
 
-### 6.2 What the proof shows
-For a request `req`, the prover shows:
+### 6.2 What each node checks
+v1 enforcement is this function, in Rust, on each signer. The node runs it only after it has rebuilt the transaction itself. It does not trust the connector's pre-check, a digest, or a proof.
 
-1. `digest = keccak(RLP(tx))` (or the EIP-712 digest for typed data), and `tx` parses to `(chainId, to, value, data, nonce)`.
+For a request `req`, the node refuses to sign unless:
+
+1. `digest = keccak(RLP(tx))` (or the EIP-712 digest for typed data), and `tx` parses to `(chainId, to, value, data, nonce)`. The node computes this from the raw tx.
 2. `bot_id` is authorized for this wallet: the leaf `(bot_id, wallet, policy_hash)` is in `R_policy`, and the request carries a valid signature from the bot's credential key.
 3. `to` (and for ERC-20 transfers, the decoded recipient) is in the bot's allowlist. If `to` is a contract, the `(to, selector)` pair is allowlisted.
-4. `usd_value(tx) <= per_tx_cap`, and `spent_24h(bot) + usd_value(tx) <= daily_cap`, where `spent_24h` is proven against **this node's** spend-log root. There is no single `R_spend` the quorum shares.
+4. `usd_value(tx) <= per_tx_cap`, and `spent_24h(bot) + usd_value(tx) <= daily_cap`, where `spent_24h` comes from **this node's** spend log. There is no single `R_spend` the quorum shares.
 5. The kill-switch flag in `R_policy` is off for this bot and globally.
 6. The request nonce is fresh against **this node's** used set.
 7. For delegated requests: a valid, unexpired, unrevoked delegation grant signed by the human wallet is in `R_policy`, and the tx fits inside the grant's scope and caps.
 
-### 6.3 Public vs private inputs
-| Public (every node sees and checks) | Private (witness, only the prover needs it) |
-|---|---|
-| `digest` (each node recomputes it from the raw tx) | Full allowlist and Merkle paths |
-| `R_policy` (shared; must match this node's policy root). This node's `R_spend` (must match **this** node's counter head). Other nodes' spend roots may differ, and signing does not wait for them to match | Bot's `spent_24h` breakdown |
-| `bot_id`, `wallet`, `chainId` | Price inputs used for USD conversion (signed oracle quotes) |
-| request nonce, timestamp window | The bot's request signature (verified in-circuit) |
-| `new_R_spend` (this node's next head after this spend) | Policy details the bot doesn't need to see |
-
-`R_spend` is per node. A round does not need the signers to hold the same spend root. Each node checks the proof against its own head. If the heads differ, that is divergence (§6.4), not a failed agreement check: the node with the higher total may refuse while the other would sign, and the signature is produced only when every party in the quorum accepts on its own counter.
-
-> **Honest note on why ZK at all:** with only 2–3 nodes that each hold full state, every node could simply run the policy in plain code. ZK earns its place because (a) nodes don't each need the full private policy or spend history, only a root and a proof; (b) the same proof is **verifiable by third parties or on-chain**, which matters if this becomes part of Chamber; and (c) it standardizes "what the policy is" as a circuit that can be audited. **Phase 2a can ship plain-code policy checks at every node first, then swap in proofs (2b) without changing the API.**
+### 6.3 What a node sees
+In v1 every signer holds the policy and its own spend log. Policy is not hidden from the node operators. `R_policy` is shared and must match this node's copy. `R_spend` is per node. A round does not need the signers to hold the same spend root. Each node checks the request against its own head. If the heads differ, that is divergence (§6.4), not a failed agreement check: the node with the higher total may refuse while the other would sign, and the signature is produced only when every party in the quorum accepts on its own counter.
 
 ### 6.4 Spend counters (daily caps)
 Daily caps are state. A bot must not be able to spread spends across nodes, and a compromised node (T3) must not be able to erase or rewrite what an honest node has already counted. **Raft is not used.** It is crash-fault tolerant only: a malicious replica can equivocate, forge entries, or stall commit, and the threat model already assumes one signer node can be compromised.
@@ -218,15 +208,19 @@ Daily caps are state. A bot must not be able to spread spends across nodes, and 
 
 Tradeoffs of independent counters:
 - **Leak at the edges.** A compromised node can still co-sign up to the cap with an honest node whose counter is missing earlier spends (the honest node was offline, or the spends were sessions it did not join and has not imported). The honest node's refusal only covers spends it knows. Monitoring `R_spend` divergence (§9.2) is the tripwire for that drift.
-- **ZK proofs.** Each node checks the proof's `R_spend` against **its own** root, not against a cluster-committed root. A proof built on a compromised node's smaller root fails at the honest node. `new_R_spend` is that node's next root.
+- **Local check.** The node applies the cap to its own counter head. It does not take `spent_24h` from the coordinator or from another node. `new_R_spend` is that node's next head.
 
-**Optional: a BFT log, for one shared root.** If the operators want a single `R_spend` instead of drifted counters, the signer nodes can keep a Byzantine log. The root advances only when that log commits the entry, and a node refuses to sign unless the proof's `R_spend` is its latest committed root. This serializes spends and removes the drift leak. The cost is a BFT implementation, liveness tied to the BFT quorum, and extra latency. It is not required for the cap invariant above. Raft is not a substitute: a crash-fault log trusts replicas not to lie, and a compromised node is a Byzantine replica.
+**Optional: a BFT log, for one shared root.** If the operators want a single `R_spend` instead of drifted counters, the signer nodes can keep a Byzantine log. The root advances only when that log commits the entry, and a node refuses to sign unless the request matches its latest committed root. This serializes spends and removes the drift leak. The cost is a BFT implementation, liveness tied to the BFT quorum, and extra latency. It is not required for the cap invariant above. Raft is not a substitute: a crash-fault log trusts replicas not to lie, and a compromised node is a Byzantine replica.
 
 **On-chain anchoring** of a spend root (for example on Base) remains a possible Chamber feature for a public audit trail. It is not needed for v1, and it does not replace the per-node refusal check.
 
-USD pricing uses a signed price quote (for example from a Chainlink or Pyth reading fetched by the coordinator, signature-checked in-circuit or by the nodes), with a staleness bound. Stablecoins are priced at 1.0 with a depeg guard.
+USD pricing uses a signed price quote (for example from a Chainlink or Pyth reading fetched by the coordinator and checked by the nodes), with a staleness bound. Stablecoins are priced at 1.0 with a depeg guard.
 
-### 6.5 Candidate proving systems
+### 6.5 Later option: ZK policy proofs (not v1)
+v1 does not use ZK policy proofs. Nodes see the policy and run §6.2 in Rust. Proofs are added only when third-party node operators or customers need a publicly verifiable proof that policy was followed, or when policy must be hidden from node operators (Phase 5). Until then, the signing path has no prover and no proof check.
+
+If that phase starts, the statement to prove is the §6.2 checks. The node still rebuilds the tx digest itself. **Noir** (UltraHonk) is the candidate for a small circuit (allowlist, caps, bot signature; Poseidon for internal roots; digest as a public input rather than keccak/RLP in-circuit). **SP1** is the alternative if we want to prove the same Rust checker, or need a Groth16 wrap for on-chain verification. RISC Zero and Circom stay on the list as comparisons, not as the v1 plan.
+
 | System | Style | Pros for us | Cons / notes |
 |---|---|---|---|
 | **Noir** (Aztec, Barretenberg / UltraHonk backend) | DSL circuits | Rust-like, good ergonomics, fast for small circuits. Public benchmarks show small Merkle-membership circuits proving in **well under ~2 s** on desktop/browser hardware ([benchmarks](https://hashcloak.github.io/semaphore-noir-final-report/benchmarks.html)) | keccak and RLP in-circuit are expensive. We'd likely use Poseidon for internal roots and prove keccak only on the tx digest |
@@ -234,9 +228,7 @@ USD pricing uses a signed price quote (for example from a Chainlink or Pyth read
 | **SP1** (Succinct) | zkVM (RISC-V, Rust) | Same benefits as RISC Zero, with strong GPU performance (SP1 Hypercube real-time L1 proving on 16 GPUs, [blog](https://blog.succinct.xyz/real-time-proving-16-gpus/)). Can wrap to Groth16 for cheap on-chain verification | GPU or proving-network cost. The Groth16 wrap adds time |
 | **Circom + Groth16** | R1CS circuits | Smallest proofs, cheapest on-chain verification, mature | Per-circuit trusted setup, low-level language, more audit risk when changing the policy |
 
-**Recommendation (estimate, to validate in a spike):** use **Noir/UltraHonk** for the hot path (allowlist membership + cap arithmetic + bot signature, with internal roots in Poseidon), and the **tx digest bound as a public input** that nodes recompute natively instead of proving keccak/RLP in-circuit. Keep **SP1** as the option if we want "prove the same Rust policy code" or need on-chain verification. We have no measured numbers yet. The *target* budget is ≤2 s proving + ≤1 s TSS for a normal send, to be confirmed in Phase 2a. Verification on nodes is cheap compared with proving (milliseconds-scale for SNARKs, estimate).
-
-**Cost notes (estimates, not quotes):** the Noir path runs on a normal CPU on the connector host, so the marginal cost is roughly zero. A zkVM on a proving network or GPUs has a per-proof cost we haven't priced. If we ever verify on-chain, Groth16 is the cheapest verifier.
+We have no measured numbers. A later target to validate, not a v1 budget, is ≤2 s proving + ≤1 s TSS for a normal send. Verification on nodes is cheap compared with proving (milliseconds-scale for SNARKs, estimate). The Noir path runs on a normal CPU, so the marginal cost is roughly zero. A zkVM on a proving network or GPUs has a per-proof cost we haven't priced.
 
 ### 6.6 Threshold signing choice
 - **EVM (secp256k1 ECDSA):** **DKLs23** via Silence Laboratories' `dkls23` (Rust; supports DKG, key refresh, **quorum change**, and import/export) ([repo](https://github.com/silence-laboratories/dkls23)). **Audit facts** ([Trail of Bits report](https://github.com/trailofbits/publications/blob/master/reviews/2024-02-silencelaboratories-silentshard-securityreview.pdf), [ToB blog, Jun 10, 2025](https://blog.trailofbits.com/2025/06/10/what-we-learned-reviewing-one-of-the-first-dkls23-libraries-from-silence-laboratories/)): ToB reviewed `dkls23@1510c2fafe3c` + `sl-crypto@a6b014722a29` **Nov 20 – Dec 8, 2023** (the blog says "October 2023"), reviewed fixes **Jan 22–30, 2024**, and dated the report **Feb 2024**. They found 15 issues (2 High, 5 Medium, 2 Low, 6 Informational), with no direct key-recovery bug but several key-destruction paths. 14 were resolved and TOB-SILA-13 was partially resolved. The audit scope covered DKG **with key refresh**, signing, OT, messaging, and (as a supplement) RVOLE. It did **not** list quorum change, import/export, or migration. Or **CGGMP** via LFDT-Lockness `cggmp21` (MIT/Apache-2.0, audited by Kudelski; **must be ≥0.6.3** because of a critical Nov 2025 advisory where one malicious signer could reconstruct the key, and the maintainers recommend migrating to `cggmp24`; the crate does **not** currently support key refresh for t-of-n keys) ([advisory](https://github.com/LFDT-Lockness/cggmp21/security/advisories/GHSA-m95p-425x-x889)). Coinbase's `cb-mpc` (C++, MIT) is a third option.
@@ -251,7 +243,7 @@ USD pricing uses a signed price quote (for example from a Chainlink or Pyth read
 
 ## 7. MCP tool API spec
 
-All tools take the caller identity (`bot_id` or `user_id`) implicitly from the authenticated connection (never from arguments). All state-changing tools run **simulate → policy → prove → sign → broadcast**, accept `dry_run: true`, and return a `request_id` for `tx_status`.
+All tools take the caller identity (`bot_id` or `user_id`) implicitly from the authenticated connection (never from arguments). All state-changing tools run **simulate → policy → sign → broadcast**, accept `dry_run: true`, and return a `request_id` for `tx_status`.
 
 | Tool | Inputs | Output | Notes |
 |---|---|---|---|
@@ -263,7 +255,7 @@ All tools take the caller identity (`bot_id` or `user_id`) implicitly from the a
 | `call_contract` | `chain, to, abi_fragment or data, args, value?` | `{request_id, decoded_call, simulation, tx_hash?}` | `(to, selector)` must be allowlisted |
 | `sign_message` | `message (EIP-191)` | `{signature}` | Text only. Messages that look like hex-encoded tx/permits are rejected |
 | `sign_typed_data` | `EIP-712 domain, types, message` | `{signature}` | Decoded and policy-checked. Permit/Permit2/approvals are capped by amount and deadline |
-| `tx_status` | `request_id or tx_hash` | `{state: queued/pending_user_approval/proving/signing/broadcast/confirmed/failed/refused, reasons, confirmations}` | Read-only |
+| `tx_status` | `request_id or tx_hash` | `{state: queued/pending_user_approval/signing/broadcast/confirmed/failed/refused, reasons, confirmations}` | Read-only |
 | `hl_place_order` / `hl_cancel` / `hl_modify` / `hl_positions` / `hl_set_leverage` | Hyperliquid params | HL API response | Via the agent wallet (§8) |
 | `limits` | — | `{daily_cap, spent_24h, per_tx_cap, allowlists (redacted)}` | Lets bots self-limit |
 | `approve_request` / `reject_request` | `request_id` (+ on-device passkey/biometric assertion) | `{state}` | Human wallets only. Must come from the user's device |
@@ -323,7 +315,7 @@ Hyperliquid has a built-in fit: an **API wallet (agent wallet)** that a master a
 - An independent **chain watcher** alerts on any outgoing tx from a wallet that has no matching `request_id` in the audit log. This is the tripwire for a T4 compromise.
 
 ### 9.3 Audit log
-- Append-only and hash-chained. Each entry records `request_id, bot_id, tool, raw request, simulation summary, policy version, proof hash, per-node verdicts, tx hash, timestamps`.
+- Append-only and hash-chained. Each entry records `request_id, bot_id, tool, raw request, simulation summary, policy version, per-node verdicts, tx hash, timestamps`.
 - Mirrored to at least two places (for example node storage plus an object store), with the head hash periodically anchored (optional, on-chain or in TeamShared).
 
 ### 9.4 Kill switch
@@ -365,7 +357,7 @@ Per TOB-SILA-12 and the DKLs23 paper, a failed OT/COTe consistency check can lea
 The TOB-SILA-9 fix was documentation only ("It is *ABSOLUTELY* essential to use a unique `InstanceId`"), so uniqueness is **our** job.
 - **Construction:** for every DKG, refresh, quorum change, and signing session:
   `instance_id = H("keyshare/v1" ‖ library_version ‖ wallet ‖ dkg_sid ‖ refresh_epoch ‖ op_type ‖ party_set ‖ threshold ‖ request_id ‖ digest ‖ R_policy ‖ 32-byte fresh random)`.
-  The `request_id` and digest are the ones the ZK proof commits to (§6.2), so a proof and a signing session can't be mixed and matched. `R_spend` is **not** in this shared id. Each party binds its own counter head in the proof and in its local log (§6.3, §6.4). Differing heads do not produce mismatched session ids, and the parties do not abort because they differ.
+  The `request_id` and digest are the ones the node checked in §6.2, so a signing session can't be reused for a different transaction. `R_spend` is **not** in this shared id. Each party records its own counter head in its local log (§6.3, §6.4). Differing heads do not produce mismatched session ids, and the parties do not abort because they differ.
 - **Reuse rejection:** every party records used `instance_id`s in its own append-only log (§6.4) and refuses any ID it has seen before. A compromised peer cannot erase that record.
 - **Setup validation:** our wrapper asserts that the threshold and party set match the wallet's layout before joining (TOB-SILA-15).
 
@@ -375,12 +367,12 @@ The TOB-SILA-9 fix was documentation only ("It is *ABSOLUTELY* essential to use 
 
 | Phase | Scope | Milestones / exit criteria |
 |---|---|---|
-| **Phase 0: Testnet MVP** (Sepolia, Base Sepolia, Hyperliquid testnet) | MCP connector with the full tool API, a local single-key signer (testnet only), simulation, plain-code policy, audit log, kill switch, per-bot credentials (agent wallets only) | All tools work end to end for the FillTape and Loreum bots. A red-team prompt-injection test is refused. The kill switch halts within seconds |
+| **Phase 0: Testnet MVP** (Sepolia, Base Sepolia, Hyperliquid testnet) | MCP connector with the full tool API, a local single-key signer (testnet only), simulation, plain-Rust policy, audit log, kill switch, per-bot credentials (agent wallets only). No ZK proofs | All tools work end to end for the FillTape and Loreum bots. A red-team prompt-injection test is refused. The kill switch halts within seconds |
 | **Phase 1: Interim production** (optional) | Swap the signer backend to **Turnkey** (or Privy/CDP) policy-enforced keys behind the same API. Mirror our policies into vendor policies. Small mainnet balances. HL agent wallet live for FillTape | Vendor policies match ours (tested). Root quorum held only by the owner's hardware admin key. Monthly vendor-risk review |
-| **Phase 2a: Own TSS network, plain-code policy** | DKLs23 2-of-3 with two independent nodes plus the third share per layout (the owner's cold share for agent wallets, the device share for human wallets). Every node runs the policy in plain code. Per-node signed spend counters, with an optional BFT log and no Raft (§6.4). Resharing and quorum change scripted. **Human wallet app:** device share in Secure Enclave/Keystore, passkey/biometric approval, encrypted backup (§12). Delegation grants (§6.1a). **Owner admin model:** 2 admin keys per owner, admin-action verification at nodes, timelocked loosening and admin changes (§15) | Testnet DKG + signing for both wallet types. Resharing keeps the address. Losing one share still signs, losing two refuses. A human request isn't signed without device approval. Delegation is limited by its grant and revocable. Measured latency. **MPC hardening gates** (per the [ToB report](https://github.com/trailofbits/publications/blob/master/reviews/2024-02-silencelaboratories-silentshard-securityreview.pdf)): (1) a malicious-party **negative test** suite (empty, short, or long vectors, wrong session IDs, replays, split broadcasts), with a test for every check in the DKLs23/DKG papers asserting the right error and ban behavior; (2) `proptest` property tests on our wrapper; (3) **fuzzing** of all message deserialization; (4) CI gates: `cargo-audit`, Clippy, Dylint, `cargo-llvm-cov` coverage; (5) `zip_eq` instead of bare `zip`, and `secrecy` + `zeroize` for share material; (6) an **external audit** of our integration layer (transport, session IDs, ban handling, refresh and quorum-change orchestration, share storage, backup/recovery) plus any library features outside ToB's 2023 scope that we use. Then a small mainnet balance |
-| **Phase 2b: ZK policy proofs** | Noir circuit (or SP1) for §6.2. Nodes verify proofs against `R_policy` and each node's own `R_spend`. Differential tests against the plain checker | The proof path matches the plain checker on a large fuzzed corpus. Proving + signing within the target budget. External audit of the circuit and node code |
-| **Phase 3: Chamber offering** (optional) | Package the signer network + policy circuits as a Chamber module for DAO and agent treasuries. Organization M-of-N admins, and Chamber as the admin role (§15.4–15.5). Possible on-chain anchoring of policy and spend roots | Product decision, legal review (custody), third-party audit, independent node operators beyond Chad |
-| **Phase 4 (later): Multiple addresses per wallet** | Labeled addresses (e.g., Savings, Trading) derived from one threshold key via non-hardened BIP32-style derivation (§14.2). Per-address policies in `R_policy`. `chain_path` bound into session IDs and policy proofs. Path validation in our wrapper | Derived addresses sign correctly on testnet for each path. Hardened paths are rejected before any session starts. Per-address caps enforced. Chain code / xpub never leaves share storage or appears in logs. Open questions 13–15 resolved |
+| **Phase 2: Own TSS network, plain Rust policy** | DKLs23 2-of-3 with two independent nodes plus the third share per layout (the owner's cold share for agent wallets, the device share for human wallets). Every node runs §6.2 in plain Rust. No ZK proof on the signing path. Per-node signed spend counters, with an optional BFT log and no Raft (§6.4). Resharing and quorum change scripted. **Human wallet app:** device share in Secure Enclave/Keystore, passkey/biometric approval, encrypted backup (§12). Delegation grants (§6.1a). **Owner admin model:** 2 admin keys per owner, admin-action verification at nodes, timelocked loosening and admin changes (§15) | Testnet DKG + signing for both wallet types. Resharing keeps the address. Losing one share still signs, losing two refuses. A human request isn't signed without device approval. Delegation is limited by its grant and revocable. Measured latency. **MPC hardening gates** (per the [ToB report](https://github.com/trailofbits/publications/blob/master/reviews/2024-02-silencelaboratories-silentshard-securityreview.pdf)): (1) a malicious-party **negative test** suite (empty, short, or long vectors, wrong session IDs, replays, split broadcasts), with a test for every check in the DKLs23/DKG papers asserting the right error and ban behavior; (2) `proptest` property tests on our wrapper; (3) **fuzzing** of all message deserialization; (4) CI gates: `cargo-audit`, Clippy, Dylint, `cargo-llvm-cov` coverage; (5) `zip_eq` instead of bare `zip`, and `secrecy` + `zeroize` for share material; (6) an **external audit** of our integration layer (transport, session IDs, ban handling, refresh and quorum-change orchestration, share storage, backup/recovery) plus any library features outside ToB's 2023 scope that we use. Then a small mainnet balance |
+| **Phase 3: Chamber offering** (optional) | Package the signer network and plain-Rust policy as a Chamber module for DAO and agent treasuries. Organization M-of-N admins, and Chamber as the admin role (§15.4–15.5). Possible on-chain anchoring of policy and spend roots | Product decision, legal review (custody), third-party audit, independent node operators beyond Chad |
+| **Phase 4 (later): Multiple addresses per wallet** | Labeled addresses (e.g., Savings, Trading) derived from one threshold key via non-hardened BIP32-style derivation (§14.2). Per-address policies in `R_policy`. `chain_path` bound into session IDs and the policy check. Path validation in our wrapper | Derived addresses sign correctly on testnet for each path. Hardened paths are rejected before any session starts. Per-address caps enforced. Chain code / xpub never leaves share storage or appears in logs. Open questions 13–15 resolved |
+| **Phase 5 (later, optional): ZK policy proofs** | Not part of v1. Add only when third-party node operators or customers need a publicly verifiable proof that policy was followed, or when policy must be hidden from node operators. Noir is the candidate; SP1 is the alternative if we want to prove the same Rust checker (§6.5) | The proof matches the plain-Rust checker on a large corpus. External audit of the circuit. Phases 0–2 do not depend on this |
 
 ---
 
@@ -390,7 +382,7 @@ The TOB-SILA-9 fix was documentation only ("It is *ABSOLUTELY* essential to use 
 1. **One EOA per bot or one shared EOA?** Recommendation: one per bot (a separate DKG each) for blast-radius isolation and per-bot address hygiene.
 2. **Who runs node C?** True independence means at least one node outside the owner's own cloud accounts (a trusted person, or the owner's home hardware; in Chad's deployment, Chad's).
 3. **Catastrophic-loss policy:** accept the loss vs. encrypted per-share offline backups (recommended) vs. a break-glass export.
-4. **Price source for USD caps** and how to handle it in-circuit (signed oracle quote vs. node-side check).
+4. **Price source for USD caps.** v1 checks a signed oracle quote on the node. In-circuit checking matters only if Phase 5 ships.
 5. **Phase 1 vendor:** Turnkey (most mature policy language, policy outcome proofs) vs. Privy (key reconstructed in the TEE) vs. CDP. And should we skip Phase 1 entirely?
 6. **Admin approval UX:** a passkey vs. a hardware key as each owner's two admin keys (§15.3) for above-threshold requests and policy changes.
 7. Is there **legal or custody exposure** if this becomes a Chamber product holding others' funds?
@@ -411,8 +403,7 @@ The TOB-SILA-9 fix was documentation only ("It is *ABSOLUTELY* essential to use 
 **Risks**
 - **No on-chain backstop** (deliberate, see §2). A threshold compromise or a policy bug is final on-chain. Mitigated by small balances, independence, monitoring, and resharing.
 - **Implementation risk in MPC glue.** Audited libraries still leave transport, replay, presignature single-use, and hashing to us. The Nov 2025 CGGMP21 advisory and Trail of Bits' DKLs23 findings (key destruction through nonce reuse, split views, replay, and mishandled selective abort) show how critical small checks are. **We need an external audit before meaningful balances.**
-- **Circuit soundness bugs** (under-constrained fields). Mitigated by differential testing, audits, and starting with plain-code checks (2a).
-- **Latency of ZK proving** could hurt interactive bot UX. Mitigated by Noir small circuits and digest-as-public-input. zkVM only if needed.
+- **A bug in the plain-Rust policy checker** is final on-chain, same as the missing on-chain backstop. Tests and an audit of that checker come before meaningful balances. Proving latency is not a v1 concern (Phase 5, §6.5).
 - **Liveness**: in 2-of-3, losing 2 nodes halts signing. Monitoring plus a quick quorum change onto a spare.
 - **Ops burden** for a small team. Phase 1 is the escape hatch if Phase 2 slips.
 - **Typed-data phishing** (Permit/Permit2) remains the most common real-world drain vector. Deny-by-default typed data with explicit allow rules.
@@ -486,7 +477,7 @@ sequenceDiagram
 
 ### 12.5 Agent (bot) wallets (no human signer)
 - Bot wallets have no device share. The 2-of-3 is **Node A + Node B + the owner's cold share** (or, if the bot holds a share, **bot share + Node A + the owner's cold share**). In Chad's deployment, Chad is the owner.
-- **The cold share is the one share the owner holds for bot wallets** (the owner's admin keys, §15.3, are separate and aren't shares). It's a hardware key, or an encrypted share in cold storage, kept offline and never used for day-to-day signing. Normal bot signing is Node A + Node B with the ZK policy checks (§6).
+- **The cold share is the one share the owner holds for bot wallets** (the owner's admin keys, §15.3, are separate and aren't shares). It's a hardware key, or an encrypted share in cold storage, kept offline and never used for day-to-day signing. Normal bot signing is Node A + Node B with the plain-Rust policy checks (§6).
 - What it enables: if one node is lost, **the owner + the remaining node** reach threshold to sign recovery transactions and reshare onto a replacement node (approved with the owner's admin key). If the owner's cold share is lost, the two nodes reshare a fresh cold share to the owner, after owner admin approval.
 
 **Resharing / rotation procedure (bot wallets)**
@@ -502,20 +493,20 @@ sequenceDiagram
 
 ## 13. User Experience
 
-The goal is that people never think about shares, nodes, or proofs. A human sees a plain-English preview and taps Face ID. An agent gets a tx hash or a clear refusal. The owner sees everything in one activity feed with one freeze button. Everything here sits on top of the flows in §4, the policy in §6.1/§6.1a, the tools in §7, and recovery in §12.
+The goal is that people never think about shares or nodes. A human sees a plain-English preview and taps Face ID. An agent gets a tx hash or a clear refusal. The owner sees everything in one activity feed with one freeze button. Everything here sits on top of the flows in §4, the policy in §6.1/§6.1a, the tools in §7, and recovery in §12.
 
 ### 13.1 Human signing (human wallets)
 1. **The action starts** in an app (e.g., Chamber or FillTape) or from an agent's request to a human wallet. The connector builds and **simulates** the exact tx (§4 step 2).
 2. **The phone shows a plain-English preview:** action, amount (token and USD), recipient **with its label** (address book / allowlist name, or "new address" warning), chain, fee estimate, and the simulation result (balance changes, approvals granted, reverts).
 3. **The user approves with Face ID / passkey.** That unlocks the device share in the Secure Enclave / Android Keystore for this one request only.
-4. **Phone + one node co-sign** (DKLs23, §6.6). Target ~1–2 s (estimate, to be measured in Phase 2a). The node still enforces its baseline rules (§6.1a).
+4. **Phone + one node co-sign** (DKLs23, §6.6). Target ~1–2 s (estimate, to be measured in Phase 2). The node still enforces its baseline rules (§6.1a).
 5. **The tx is broadcast** and the sheet shows the tx hash and status (`tx_status`).
 - **No seed phrase is ever shown.** The full key never exists (§1). The backup is an encrypted share protected by a passkey or recovery password.
 - **New device:** sign in with the passkey and the share is restored from the encrypted backup, then reshared. See **§12 Key Recovery** (12.3a).
 
 ### 13.2 Agent signing (agent wallets)
 1. **A bot calls a wallet tool** (`send`, `swap`, `call_contract`, `hl_*`, …) through the MCP connector with its bot credential (§7).
-2. **The connector simulates** the tx, and the **nodes check the per-bot policy** (§6.1) by verifying the policy proof (§6.2; plain-code checks in Phase 2a).
+2. **The connector simulates** the tx, and the **nodes check the per-bot policy** in plain Rust (§6.1, §6.2).
 3. **Within policy:** the two online shares (Node A + Node B, or bot share + Node A) **sign automatically**, and the bot gets the tx hash. In the bot-held layout only Node A enforces the cap (§6.4).
 4. **Outside policy** (over cap, new recipient, above `require_admin_cosign_above_usd`): the request is **held** (`pending_user_approval`) and **pushed to the owner's phone** for Face ID approval.
    - For an **agent wallet**, the owner's approval is a signed admin authorization from the owner's admin key (§15.2, §3 T11). For organization wallets above the ceiling, M-of-N admins approve (§15.4). The nodes then sign. The phone holds no share in an agent wallet.
@@ -531,7 +522,7 @@ sequenceDiagram
     participant P as Owner admin device (e.g., Chad)
     Bot->>MCP: send / swap (bot credential)
     MCP->>MCP: Build tx + simulate
-    MCP->>N: Policy check (proof / plain-code)
+    MCP->>N: Policy check (plain Rust)
     N-->>MCP: OVER LIMIT (e.g., daily cap)
     MCP-->>Bot: pending_user_approval (request_id)
     MCP->>P: Push: "FillTape wants to send $1,200 — over $500/day limit"
@@ -694,7 +685,7 @@ sequenceDiagram
 **What the user sees** (see §13 User Experience):
 1. Tap **Create wallet** and pick a name.
 2. **Face ID + passkey.** This creates or unlocks the passkey that protects the device share and its backup.
-3. A progress screen, then **the address is shown**, roughly **10–30 s** end to end (estimate, to be measured in Phase 2a). No seed phrase is ever shown (§13.1).
+3. A progress screen, then **the address is shown**, roughly **10–30 s** end to end (estimate, to be measured in Phase 2). No seed phrase is ever shown (§13.1).
 
 **What happens underneath:**
 - **DKLs23 DKG** (§6.6) among the wallet's three parties:
@@ -787,7 +778,7 @@ sequenceDiagram
 - **Non-hardened risk.** With non-hardened derivation, **a leaked child private key plus the chain code exposes the parent key**. In our design **no child private key is ever materialized**: signing uses the adjusted shares, never a reconstructed key. So this risk only reappears if a key is ever exported (break-glass, §9.6), which stays rejected by default.
 - **Linkability.** Addresses are **publicly linkable to each other only if the chain code / xpub leaks**. Treat `(PK, chain_code)` as confidential: store it with the shares, never publish an xpub, and keep it out of logs and analytics. Without it, on-chain observers see unrelated EOAs (unless funding patterns link them).
 - **Shared fate.** All addresses share one threshold key, so a key compromise, ban event (§9.7), or refresh affects them all at once. Use **separate DKGs** where blast-radius isolation matters (e.g., one wallet per bot, §11 Q1). Use derived addresses for labeling and organization within one owner's wallet.
-- **Policy keyed by address.** The nodes must bind `chain_path` into the session ID (§9.8) and the policy proof (§6.2), so a request can't be signed under a different child than the one the policy approved.
+- **Policy keyed by address.** The nodes must bind `chain_path` into the session ID (§9.8) and the policy check (§6.2), so a request can't be signed under a different child than the one the policy approved.
 
 ## 15. Owner admin model
 
