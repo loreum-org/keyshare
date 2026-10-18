@@ -55,7 +55,7 @@ flowchart LR
   LH["Human wallet = Device + Node A + Node B<br/>normal signing: Device + 1 node"]
   LA["Agent wallet = Node A + Node B + Owner cold<br/>(or Bot share + Node A + Owner cold)<br/>normal signing: 2 online shares"]
 
-  STATE[(Replicated policy + spend log<br/>+ delegation grants<br/>Merkle root committed)]
+  STATE[(Policy store + per-node spend counters<br/>+ delegation grants<br/>Merkle root committed)]
   ADMIN[Owner admin keys<br/>passkey + hardware key, not shares<br/>or M-of-N org admins / Chamber]
   RPC[(Chain RPCs<br/>Ethereum, Base, Arbitrum)]
   HLAPI[(Hyperliquid API)]
