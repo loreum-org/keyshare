@@ -5,11 +5,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
+use keyshare_core::hyperliquid::HlPolicy;
 use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
+use crate::hl::{HlConfig, Hyperliquid};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +22,8 @@ pub struct Config {
     pub chains: Vec<ChainConfig>,
     #[serde(default)]
     pub prices: Vec<PriceEntry>,
+    /// Hyperliquid API settings. Bots trade there only with a `[bots.<id>.hyperliquid]` table.
+    pub hyperliquid: Option<HlConfig>,
     /// Keyed by bot id.
     pub bots: HashMap<String, BotConfig>,
 }
@@ -54,6 +58,8 @@ pub struct BotConfig {
     #[serde(default)]
     pub admin_keys: Vec<Address>,
     pub policy: PlainPolicy,
+    /// Hyperliquid testnet guardrails. Without this table the `hl_*` tools refuse this bot.
+    pub hyperliquid: Option<HlPolicy>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,5 +126,11 @@ impl Config {
         std::fs::create_dir_all(&self.server.state_dir)
             .map_err(|e| ConfigError::Read(self.server.state_dir.clone(), e))?;
         Wallet::open(accounts, Box::new(prices), &self.state_paths()).map_err(|e| ConfigError::Other(e.to_string()))
+    }
+
+    pub fn hyperliquid(&self) -> Hyperliquid {
+        let policies =
+            self.bots.iter().filter_map(|(bot, cfg)| Some((bot.clone(), cfg.hyperliquid.clone()?))).collect();
+        Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies)
     }
 }

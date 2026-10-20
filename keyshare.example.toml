@@ -14,6 +14,10 @@ state_dir = "./state"
 # How long a held request waits for the owner (seconds). Default 900.
 # hold_secs = 900
 
+# Hyperliquid API. Default is testnet; Phase 0 signs for testnet only.
+# [hyperliquid]
+# api_url = "https://api.hyperliquid-testnet.xyz"
+
 # RPC per chain. Chain tools refuse chains not listed here.
 [[chains]]
 id = 11155111                  # Sepolia
@@ -49,3 +53,13 @@ typed_data_allow = []
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
 selectors = ["0xa9059cbb"]     # USDC transfer
+
+# Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
+# agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
+# the size caps and the loss stop.
+[bots.filltape.hyperliquid]
+markets = ["ETH", "BTC"]
+max_order_usd = 1000           # size x limit price
+max_position_usd = 2000        # per coin, after the order fills
+max_leverage = 5
+daily_loss_stop_usd = 100      # vs account value at the first order of the UTC day
