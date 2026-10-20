@@ -25,6 +25,10 @@ pub enum RefusalCode {
     SimRevert,
     RpcUnavailable,
     ThresholdUnavailable,
+    /// Swap: asked for more slippage than the policy allows.
+    SlippageTooHigh,
+    /// Swap: no pool quotes this pair.
+    NoRoute,
     /// Hyperliquid: coin not on the bot's market list.
     MarketNotAllowed,
     OrderTooLarge,
