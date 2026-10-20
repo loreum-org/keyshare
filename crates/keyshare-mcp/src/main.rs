@@ -6,6 +6,7 @@ use keyshare_core::killswitch::KillSwitch;
 use keyshare_mcp::auth::new_token;
 use keyshare_mcp::chain::Chains;
 use keyshare_mcp::config::Config;
+use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
 
 const USAGE: &str = "\
 usage:
@@ -48,7 +49,9 @@ async fn serve(path: PathBuf) -> Result<()> {
     }
     let chains = Arc::new(Chains::new(&config.chains)?);
     let tokens = Arc::new(config.prices.clone());
-    let app = keyshare_mcp::app(Arc::new(Mutex::new(wallet)), chains, tokens, creds, &config.server.allowed_hosts);
+    let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
+    let exec = Arc::new(Executor::new(Arc::new(Mutex::new(wallet)), chains, tokens, hold));
+    let app = keyshare_mcp::app(exec, creds, config.server.admin_token_sha256, &config.server.allowed_hosts);
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     eprintln!("listening on {}", listener.local_addr()?);
     axum::serve(listener, app)

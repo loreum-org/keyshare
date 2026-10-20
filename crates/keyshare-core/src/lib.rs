@@ -1,6 +1,7 @@
 //! keyshare core: the parts of the signing path that stay the same whether a wallet is backed by
 //! one testnet key (Phase 0) or a 2-of-3 threshold key (Phase 2). See docs/design.md.
 
+pub mod approval;
 pub mod audit;
 pub mod chainlog;
 pub mod killswitch;

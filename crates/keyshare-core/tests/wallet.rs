@@ -7,8 +7,9 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, Bytes, TxKind, U256, address};
 use alloy::sol;
 use alloy::sol_types::SolCall;
+use keyshare_core::approval::{Decision, intent_hash, message};
 use keyshare_core::price::PriceEntry;
-use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, RefusalCode, StatePaths, Wallet};
+use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, RefusalCode, Signer, StatePaths, Wallet};
 
 sol! { function transfer(address to, uint256 amount); }
 
@@ -20,6 +21,7 @@ const NOW: u64 = 1_800_000_000;
 
 struct Fixture {
     wallet: Wallet,
+    admin: LocalSigner,
     paths: StatePaths,
     _dir: tempfile::TempDir,
 }
@@ -44,16 +46,19 @@ fn fixture() -> Fixture {
         "#
     ))
     .unwrap();
+    let admin = LocalSigner::random();
     let mut accounts = HashMap::new();
-    accounts
-        .insert("filltape".to_string(), Account { signer: Box::new(LocalSigner::random()), policy: Box::new(policy) });
+    accounts.insert(
+        "filltape".to_string(),
+        Account { signer: Box::new(LocalSigner::random()), policy: Box::new(policy), admins: vec![admin.address()] },
+    );
     let prices = PriceTable::from_entries(&[
         PriceEntry { chain_id: CHAIN, token: None, decimals: 18, usd: "2000".into() },
         PriceEntry { chain_id: CHAIN, token: Some(USDC), decimals: 6, usd: "1".into() },
     ])
     .unwrap();
     let wallet = Wallet::open(accounts, Box::new(prices), &paths).unwrap();
-    Fixture { wallet, paths, _dir: dir }
+    Fixture { wallet, admin, paths, _dir: dir }
 }
 
 fn usdc_transfer(to: Address, dollars: u64, nonce: u64) -> TxEip1559 {
@@ -141,4 +146,48 @@ fn message_signing_recovers_to_wallet() {
     let mut f = fixture();
     let sig = f.wallet.sign_message("filltape", "m1", b"Sign in to example.com", NOW).unwrap();
     assert_eq!(sig.recover_address_from_msg(b"Sign in to example.com").unwrap(), f.wallet.address("filltape").unwrap());
+}
+
+#[test]
+fn owner_approval_signs_a_held_send_once() {
+    let mut f = fixture();
+    let tx = usdc_transfer(ATTACKER, 1_000, 0);
+    assert_eq!(
+        f.wallet.preview("filltape", keyshare_core::Action::Transaction(&tx), NOW).unwrap_err().code,
+        RefusalCode::RecipientNotAllowed
+    );
+
+    let msg = message(Decision::Approve, "filltape", "held-1", intent_hash(&tx));
+    let sig = f.admin.sign_message(msg.as_bytes()).unwrap();
+    f.wallet.sign_transaction_approved("filltape", "held-1", tx.clone(), &sig, NOW).unwrap();
+    // Counted against the cap, and the approval can't be replayed.
+    assert_eq!(f.wallet.spent_24h("filltape", NOW), 1_000_000_000);
+    let r = f.wallet.sign_transaction_approved("filltape", "held-1", tx, &sig, NOW).unwrap_err();
+    assert_eq!(r.code, RefusalCode::NonceReused);
+}
+
+#[test]
+fn approval_from_a_stranger_or_for_another_tx_is_refused() {
+    let mut f = fixture();
+    let tx = usdc_transfer(ATTACKER, 1_000, 0);
+    let msg = message(Decision::Approve, "filltape", "held-1", intent_hash(&tx));
+    let stranger = LocalSigner::random().sign_message(msg.as_bytes()).unwrap();
+    let r = f.wallet.sign_transaction_approved("filltape", "held-1", tx.clone(), &stranger, NOW).unwrap_err();
+    assert_eq!(r.code, RefusalCode::BadApproval);
+
+    let sig = f.admin.sign_message(msg.as_bytes()).unwrap();
+    let swapped = usdc_transfer(ATTACKER, 9_000, 0);
+    let r = f.wallet.sign_transaction_approved("filltape", "held-1", swapped, &sig, NOW).unwrap_err();
+    assert_eq!(r.code, RefusalCode::BadApproval);
+}
+
+#[test]
+fn kill_switch_beats_owner_approval() {
+    let mut f = fixture();
+    let tx = usdc_transfer(ATTACKER, 1, 0);
+    let msg = message(Decision::Approve, "filltape", "held-1", intent_hash(&tx));
+    let sig = f.admin.sign_message(msg.as_bytes()).unwrap();
+    f.wallet.kill_switch().set(None, true).unwrap();
+    let r = f.wallet.sign_transaction_approved("filltape", "held-1", tx, &sig, NOW).unwrap_err();
+    assert_eq!(r.code, RefusalCode::KillSwitch);
 }
