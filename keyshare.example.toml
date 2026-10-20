@@ -70,6 +70,8 @@ selectors = ["0xa9059cbb", "0x095ea7b3"]   # USDC transfer, approve (exact amoun
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
 selectors = ["0x04e45aaf"]     # Uniswap SwapRouter02 exactInputSingle
+# Only exactInputSingle is checked against prices. Don't allowlist the router's other
+# selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
 
 # Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
 # agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
