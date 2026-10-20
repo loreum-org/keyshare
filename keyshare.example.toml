@@ -35,6 +35,12 @@ decimals = 18
 usd = "2500"
 
 [[prices]]
+chain_id = 11155111            # Sepolia WETH (swaps can only buy priced tokens)
+token = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+decimals = 18
+usd = "2500"
+
+[[prices]]
 chain_id = 11155111            # Sepolia USDC
 token = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
 decimals = 6
@@ -54,6 +60,7 @@ daily_cap_usd = 500
 recipients_allow = []
 typed_data_allow = []
 max_slippage_bps = 100         # swaps accept at most 1% below the quote
+max_price_deviation_bps = 500  # swap minimum output must be within 5% of the input at the prices above
 # require_admin_cosign_above_usd = 100   # owner approves anything above this, even inside the caps
 
 [[bots.filltape.policy.contracts_allow]]
