@@ -2,11 +2,21 @@
 
 A threshold-signing wallet for humans and agents. The signing key is a plain EOA from a 2-of-3 distributed key generation, so the full private key never exists. Policy is enforced off-chain by the signer nodes and, in the target design, ZK proofs. There is no Safe or smart-account layer.
 
-**Status:** design phase. Draft v0.1 (Oct 18, 2026). Phase 0 has not started. This repository is documentation only.
+**Status:** Phase 0 (testnet MVP) in progress. Design draft v0.1 (Oct 18, 2026).
 
 **License:** TBD
 
 Full design: [docs/design.md](docs/design.md).
+
+## Code
+
+| Crate | What it does |
+|---|---|
+| `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path that ties them together. |
+
+```sh
+cargo test
+```
 
 ## What it is
 
@@ -85,7 +95,7 @@ flowchart LR
 
 | Phase | Scope |
 |---|---|
-| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-code policy, audit log, kill switch. **Not started.** |
+| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-code policy, audit log, kill switch. **In progress.** |
 | **1 — Interim production** (optional) | Same API, vendor policy-enforced keys (Turnkey, or Privy/CDP). Small mainnet balances. |
 | **2a — Own TSS network** | DKLs23 2-of-3, plain-code policy at every node, human wallet app, owner admin model. |
 | **2b — ZK policy proofs** | Nodes verify proofs against committed policy and spend roots. |
