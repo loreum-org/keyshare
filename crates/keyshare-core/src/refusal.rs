@@ -19,6 +19,7 @@ pub enum RefusalCode {
     NonceReused,
     CounterBehindAnchor,
     SimRevert,
+    RpcUnavailable,
     ThresholdUnavailable,
     Internal,
 }

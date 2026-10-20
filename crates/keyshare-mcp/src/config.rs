@@ -9,10 +9,15 @@ use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
 use serde::Deserialize;
 
+use crate::chain::ChainConfig;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
+    /// RPC endpoint per chain. Chain tools refuse chains not listed here.
+    #[serde(default)]
+    pub chains: Vec<ChainConfig>,
     #[serde(default)]
     pub prices: Vec<PriceEntry>,
     /// Keyed by bot id.
