@@ -15,6 +15,18 @@ sol! {
     function transfer(address to, uint256 amount);
     function approve(address spender, uint256 amount);
     function setApprovalForAll(address operator, bool approved);
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    /// Uniswap SwapRouter02.
+    function exactInputSingle(ExactInputSingleParams params);
 }
 
 pub type Selector = FixedBytes<4>;
@@ -55,6 +67,7 @@ pub struct Limits {
     pub recipients_allowed: usize,
     pub contracts_allowed: usize,
     pub typed_data_allowed: usize,
+    pub max_slippage_bps: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +95,17 @@ pub struct PlainPolicy {
     /// Sends worth more than this (whole USD) need the owner's approval even inside the caps.
     #[serde(default)]
     pub require_admin_cosign_above_usd: Option<u64>,
+    /// Most slippage a swap may accept, in basis points (100 = 1%).
+    #[serde(default = "default_slippage_bps")]
+    pub max_slippage_bps: u32,
+    /// The wallet's own address, set when the wallet is built. Swap output may go here without
+    /// being on `recipients_allow`.
+    #[serde(skip)]
+    pub own_address: Option<Address>,
+}
+
+fn default_slippage_bps() -> u32 {
+    100
 }
 
 fn refuse(code: RefusalCode, reason: impl Into<String>) -> Refusal {
@@ -173,6 +197,14 @@ impl PlainPolicy {
             }
             // An approval can move that much later, so it counts as outflow now.
             Self::price(prices, tx.chain_id, Some(to), call.amount)?
+        } else if selector == exactInputSingleCall::SELECTOR {
+            let call = exactInputSingleCall::abi_decode(data)
+                .map_err(|e| refuse(RefusalCode::ContractNotAllowed, format!("bad swap calldata: {e}")))?;
+            // The input was already counted (approve, or native value); the output must not leave.
+            if Some(call.params.recipient) != self.own_address {
+                self.check_recipient(call.params.recipient, approved)?;
+            }
+            0
         } else {
             // Other allowlisted calls (e.g. a router) count native value only until simulation
             // asset deltas feed the check.
@@ -287,6 +319,7 @@ impl PolicyEngine for PlainPolicy {
             recipients_allowed: self.recipients_allow.len(),
             contracts_allowed: self.contracts_allow.len(),
             typed_data_allowed: self.typed_data_allow.len(),
+            max_slippage_bps: self.max_slippage_bps,
         }
     }
 }
@@ -391,6 +424,29 @@ mod tests {
         assert_eq!(code(check(&usdc_transfer(FRIEND, 201), 0)), RefusalCode::PerTxCapExceeded);
         assert!(check(&usdc_transfer(FRIEND, 200), 300 * MICROS_PER_USD).is_ok());
         assert_eq!(code(check(&usdc_transfer(FRIEND, 200), 301 * MICROS_PER_USD)), RefusalCode::CapExceeded);
+    }
+
+    #[test]
+    fn swap_output_goes_to_self_or_an_allowlisted_recipient() {
+        let mut p = policy();
+        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        let me = address!("0x9999999999999999999999999999999999999999");
+        p.own_address = Some(me);
+        let swap = |recipient| {
+            let params = ExactInputSingleParams {
+                tokenIn: USDC,
+                tokenOut: USDC,
+                fee: Default::default(),
+                recipient,
+                amountIn: U256::from(1),
+                amountOutMinimum: U256::ZERO,
+                sqrtPriceLimitX96: Default::default(),
+            };
+            tx(ROUTER, U256::ZERO, exactInputSingleCall { params }.abi_encode())
+        };
+        assert!(p.check(Action::Transaction(&swap(me)), 0, &prices()).is_ok());
+        assert!(p.check(Action::Transaction(&swap(FRIEND)), 0, &prices()).is_ok());
+        assert_eq!(code(p.check(Action::Transaction(&swap(STRANGER)), 0, &prices())), RefusalCode::RecipientNotAllowed);
     }
 
     #[test]

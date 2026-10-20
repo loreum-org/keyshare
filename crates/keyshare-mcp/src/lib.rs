@@ -8,6 +8,7 @@ pub mod config;
 pub mod exec;
 pub mod hl;
 pub mod server;
+pub mod swap;
 
 use std::sync::Arc;
 
