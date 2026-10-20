@@ -15,7 +15,7 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use keyshare_core::{Refusal, RefusalCode};
+use keyshare_core::{Action, Refusal, RefusalCode};
 use serde_json::{Value, json};
 
 use crate::chain::{self, UniswapV3, rpc_err};
@@ -143,6 +143,37 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
         out
     };
 
+    let call = exactInputSingleCall {
+        params: ExactInputSingleParams {
+            tokenIn: plan.token_in,
+            tokenOut: req.buy_token,
+            fee: U24::from(plan.quote.fee),
+            recipient: owner,
+            amountIn: plan.amount_in,
+            amountOutMinimum: plan.min_out,
+            sqrtPriceLimitX96: Default::default(),
+        },
+    };
+    let tx = TxEip1559 {
+        chain_id: req.chain_id,
+        to: TxKind::Call(u.router),
+        value: if req.sell_token.is_none() { plan.amount_in } else { U256::ZERO },
+        input: call.abi_encode().into(),
+        ..Default::default()
+    };
+
+    // Check the swap itself before approving anything, so a swap the policy refuses never
+    // leaves an approve behind.
+    let (c, t) = (caller.to_string(), tx.clone());
+    if let Err(r) = exec.with_wallet(move |w| w.preview(&c, Action::Transaction(&t), crate::exec::now())).await? {
+        if !req.dry_run {
+            let (c, k, r2) = (caller.to_string(), crate::exec::scoped(caller, id), r.clone());
+            let d = json!({ "swap": quote_json.clone() });
+            exec.with_wallet(move |w| w.log_refusal(&c, &k, d, &r2, crate::exec::now())).await?;
+        }
+        return Ok(with_quote(Err(refusal(id, &r))));
+    }
+
     // Approve the router for exactly this amount when the current allowance is short.
     let mut approve_out = None;
     if let Some(token) = req.sell_token {
@@ -193,24 +224,6 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
         }
     }
 
-    let call = exactInputSingleCall {
-        params: ExactInputSingleParams {
-            tokenIn: plan.token_in,
-            tokenOut: req.buy_token,
-            fee: U24::from(plan.quote.fee),
-            recipient: owner,
-            amountIn: plan.amount_in,
-            amountOutMinimum: plan.min_out,
-            sqrtPriceLimitX96: Default::default(),
-        },
-    };
-    let tx = TxEip1559 {
-        chain_id: req.chain_id,
-        to: TxKind::Call(u.router),
-        value: if req.sell_token.is_none() { plan.amount_in } else { U256::ZERO },
-        input: call.abi_encode().into(),
-        ..Default::default()
-    };
     let mut out = exec.submit(caller, id, tx, req.dry_run).await?;
     if let (Some(a), Ok(v) | Err(v)) = (approve_out, &mut out) {
         v["approve"] = a;
