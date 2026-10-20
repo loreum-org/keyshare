@@ -216,11 +216,9 @@ impl PlainPolicy {
             // The guaranteed output must be worth close to the input at configured prices. This
             // binds every route to the router, not only the swap tool: no zero minimum, no
             // unpriced output token, no quote taken from an already-pushed pool.
-            let value_in = if tx.value.is_zero() {
-                Self::price(prices, tx.chain_id, Some(p.tokenIn), p.amountIn)?
-            } else {
-                native
-            };
+            // The larger of what is sent and what the router may pull: SwapRouter02 takes
+            // `amountIn` of `tokenIn` by transferFrom when `msg.value` doesn't cover it.
+            let value_in = native.max(Self::price(prices, tx.chain_id, Some(p.tokenIn), p.amountIn)?);
             let value_out = prices.value_usd(tx.chain_id, Some(p.tokenOut), p.amountOutMinimum).ok_or_else(|| {
                 refuse(RefusalCode::PriceUnavailable, format!("swap output token {} has no USD price", p.tokenOut))
             })?;
@@ -484,6 +482,10 @@ mod tests {
         assert_eq!(code(check(swap(me, USDC, 94_999_999))), RefusalCode::SlippageTooHigh);
         assert_eq!(code(check(swap(me, USDC, 0))), RefusalCode::SlippageTooHigh, "no zero minimum");
         assert_eq!(code(check(swap(me, STRANGER, 99_000_000))), RefusalCode::PriceUnavailable);
+        // A native value of 1 wei can't stand in for the amountIn the router will pull.
+        let mut dust = swap(me, USDC, 0);
+        dust.value = U256::from(1);
+        assert_eq!(code(check(dust)), RefusalCode::SlippageTooHigh);
     }
 
     #[test]
