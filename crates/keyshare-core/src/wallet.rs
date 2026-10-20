@@ -77,6 +77,10 @@ impl Wallet {
         Ok(self.account(caller)?.signer.address())
     }
 
+    pub fn limits(&self, caller: &str) -> Result<crate::policy::Limits, Refusal> {
+        Ok(self.account(caller)?.policy.limits())
+    }
+
     pub fn spent_24h(&self, caller: &str, now: u64) -> UsdMicros {
         self.spend.spent_24h(caller, now)
     }
