@@ -25,6 +25,18 @@ pub enum RefusalCode {
     SimRevert,
     RpcUnavailable,
     ThresholdUnavailable,
+    /// Hyperliquid: coin not on the bot's market list.
+    MarketNotAllowed,
+    OrderTooLarge,
+    PositionTooLarge,
+    LeverageTooHigh,
+    DailyLossStop,
+    /// Hyperliquid: no approved, unexpired agent key for this bot.
+    NoAgentKey,
+    /// Hyperliquid API unreachable or returned something unreadable.
+    VenueUnavailable,
+    /// The request itself is malformed.
+    BadArgs,
     Internal,
 }
 

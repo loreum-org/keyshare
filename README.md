@@ -13,13 +13,15 @@ Full design: [docs/design.md](docs/design.md).
 | Crate | What it does |
 |---|---|
 | `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path that ties them together. |
-| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `balances`, `simulate`, `send`, `call_contract`, `tx_status`, `sign_message`, `sign_typed_data`. Over-limit requests wait for the owner's signed approval at `/admin/decide`. |
+| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `balances`, `simulate`, `send`, `call_contract`, `tx_status`, `sign_message`, `sign_typed_data`. Over-limit requests wait for the owner's signed approval at `/admin/decide`. Hyperliquid testnet: `hl_place_order`, `hl_modify`, `hl_cancel`, `hl_set_leverage`, `hl_positions`, signed by a short-lived agent key and checked against the bot's markets, size caps, leverage cap and daily loss stop. |
 
 ```sh
 cargo test
 keyshare-mcp new-token                                  # bot token + hash for the config
 FILLTAPE_KEY=0x... keyshare-mcp serve keyshare.example.toml
 keyshare-mcp freeze keyshare.example.toml [bot]         # kill switch
+FILLTAPE_KEY=0x... keyshare-mcp hl-approve-agent keyshare.example.toml filltape [hours]
+                                                        # new Hyperliquid agent key (default 48h)
 ```
 
 ## What it is
