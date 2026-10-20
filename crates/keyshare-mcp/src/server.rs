@@ -2,8 +2,7 @@
 //! get the same kill switch, policy, spend counter and audit log as every other signature.
 //! Transactions follow §4: build → policy pre-check → simulate → sign → broadcast.
 
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use alloy::consensus::TxEip1559;
 use alloy::dyn_abi::TypedData;
@@ -11,8 +10,7 @@ use alloy::primitives::utils::{ParseUnits, parse_units};
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use keyshare_core::price::{MICROS_PER_USD, PriceEntry};
-use keyshare_core::{Action, Refusal, RefusalCode, Wallet};
+use keyshare_core::{Refusal, RefusalCode, Wallet};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -22,18 +20,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::Caller;
-use crate::chain::{self, Chains};
+use crate::chain;
+use crate::exec::{Executor, Outcome, RequestState, now, scoped, usd};
 
 sol! { function transfer(address to, uint256 amount); }
 
 #[derive(Clone)]
 pub struct KeyshareServer {
-    wallet: Arc<Mutex<Wallet>>,
-    chains: Arc<Chains>,
-    /// Tokens with a configured price; `balances` reports these.
-    tokens: Arc<Vec<PriceEntry>>,
-    /// Held from nonce lookup to broadcast so two sends never get the same nonce.
-    send_lock: Arc<tokio::sync::Mutex<()>>,
+    exec: Arc<Executor>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -89,8 +83,11 @@ pub struct SimulateArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TxStatusArgs {
     pub chain_id: u64,
-    #[schemars(with = "String")]
-    pub tx_hash: B256,
+    /// Look up by transaction hash...
+    #[schemars(with = "Option<String>")]
+    pub tx_hash: Option<B256>,
+    /// ...or by the request id a state-changing tool returned.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -109,10 +106,6 @@ pub struct SignTypedDataArgs {
     pub request_id: Option<String>,
 }
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 fn caller(parts: &http::request::Parts) -> Result<String, ErrorData> {
     parts
         .extensions
@@ -121,20 +114,14 @@ fn caller(parts: &http::request::Parts) -> Result<String, ErrorData> {
         .ok_or_else(|| ErrorData::invalid_request("no authenticated caller", None))
 }
 
-/// Request ids are namespaced per caller so one bot can't burn another's ids.
-fn request_id_for(caller: &str, given: Option<String>) -> (String, String) {
-    let id = given.unwrap_or_else(|| alloy::hex::encode(&B256::random()[..16]));
-    (format!("{caller}:{id}"), id)
+fn new_request_id(given: Option<String>) -> String {
+    given.unwrap_or_else(|| alloy::hex::encode(&B256::random()[..16]))
 }
 
 fn refused(request_id: &str, r: Refusal) -> CallToolResult {
     let mut v = json!(r);
     v["request_id"] = json!(request_id);
     CallToolResult::structured_error(v)
-}
-
-fn usd(micros: u128) -> String {
-    format!("{}.{:06}", micros / MICROS_PER_USD, micros % MICROS_PER_USD)
 }
 
 fn bad_args(why: impl Into<String>) -> CallToolResult {
@@ -148,120 +135,38 @@ fn parse_wei(v: Option<String>) -> Result<U256, CallToolResult> {
     }
 }
 
-fn tx_detail(tx: &TxEip1559) -> Value {
-    json!({ "chain_id": tx.chain_id, "to": tx.to.to(), "value": tx.value, "data": tx.input })
+fn internal(e: String) -> ErrorData {
+    ErrorData::internal_error(e, None)
+}
+
+fn to_result(outcome: Outcome) -> CallToolResult {
+    match outcome {
+        Ok(v) => CallToolResult::structured(v),
+        Err(v) => CallToolResult::structured_error(v),
+    }
 }
 
 impl KeyshareServer {
-    pub fn new(wallet: Arc<Mutex<Wallet>>, chains: Arc<Chains>, tokens: Arc<Vec<PriceEntry>>) -> Self {
-        Self {
-            wallet,
-            chains,
-            tokens,
-            send_lock: Arc::new(tokio::sync::Mutex::new(())),
-            tool_router: Self::tool_router(),
-        }
+    pub fn new(exec: Arc<Executor>) -> Self {
+        Self { exec, tool_router: Self::tool_router() }
     }
 
-    /// Shared path for `send` and `call_contract`.
-    async fn submit(
-        &self,
-        caller: String,
-        request_id: Option<String>,
-        mut tx: TxEip1559,
-        dry_run: bool,
-    ) -> Result<CallToolResult, ErrorData> {
-        let (scoped, id) = request_id_for(&caller, request_id);
-        let provider = match self.chains.get(tx.chain_id) {
-            Ok(p) => p,
-            Err(r) => return Ok(refused(&id, r)),
-        };
-
-        // Policy first: a bad recipient fails fast with a readable reason, before any RPC.
-        let preview = {
-            let (c, t) = (caller.clone(), tx.clone());
-            self.with_wallet(move |w| w.preview(&c, Action::Transaction(&t), now())).await?
-        };
-        if let Err(r) = preview {
-            if dry_run {
-                return Ok(refused(&id, r));
-            }
-            let (c, s, d, r2) = (caller.clone(), scoped.clone(), tx_detail(&tx), r.clone());
-            self.with_wallet(move |w| w.log_refusal(&c, &s, d, &r2, now())).await?;
-            return Ok(refused(&id, r));
-        }
-        let outflow = preview.map(|v| v.outflow_usd).unwrap_or(0);
-
-        let from = {
-            let c = caller.clone();
-            match self.with_wallet(move |w| w.address(&c)).await? {
-                Ok(a) => a,
-                Err(r) => return Ok(refused(&id, r)),
-            }
-        };
-
-        let _guard = if dry_run { None } else { Some(self.send_lock.lock().await) };
-        let sim = match chain::fill_and_simulate(provider, from, &mut tx).await {
-            Ok(sim) => sim,
-            Err(r) => return Ok(refused(&id, r)),
-        };
-        if !sim.ok {
-            let r = Refusal::new(RefusalCode::SimRevert, sim.revert.clone().unwrap_or_default());
-            if !dry_run {
-                let (c, s, d, r2) = (caller.clone(), scoped.clone(), tx_detail(&tx), r.clone());
-                self.with_wallet(move |w| w.log_refusal(&c, &s, d, &r2, now())).await?;
-            }
-            let mut out = json!(r);
-            out["request_id"] = json!(id);
-            out["simulation"] = json!(sim);
-            return Ok(CallToolResult::structured_error(out));
-        }
-        if dry_run {
-            return Ok(CallToolResult::structured(json!({
-                "request_id": id,
-                "dry_run": true,
-                "policy_verdict": "allowed",
-                "outflow_usd": usd(outflow),
-                "simulation": sim,
-                "tx": { "nonce": tx.nonce, "gas_limit": tx.gas_limit, "max_fee_per_gas": tx.max_fee_per_gas },
-            })));
-        }
-
-        let signed = {
-            let (c, s) = (caller.clone(), scoped.clone());
-            match self.with_wallet(move |w| w.sign_transaction(&c, &s, tx, now())).await? {
-                Ok(signed) => signed,
-                Err(r) => return Ok(refused(&id, r)),
-            }
-        };
-        match chain::broadcast(provider, &signed.raw).await {
-            Ok(_) => Ok(CallToolResult::structured(json!({
-                "request_id": id,
-                "tx_hash": signed.hash,
-                "outflow_usd": usd(outflow),
-                "simulation": sim,
-            }))),
-            Err(r) => {
-                let mut out = json!(r);
-                out["request_id"] = json!(id);
-                out["tx_hash"] = json!(signed.hash);
-                Ok(CallToolResult::structured_error(out))
-            }
-        }
-    }
-
-    /// Runs `f` on the wallet off the async runtime (it does fsyncs).
     async fn with_wallet<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
     ) -> Result<T, ErrorData> {
-        let wallet = self.wallet.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut w = wallet.lock().map_err(|_| ErrorData::internal_error("wallet lock poisoned", None))?;
-            Ok(f(&mut w))
-        })
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        self.exec.with_wallet(f).await.map_err(internal)
+    }
+
+    async fn submit(
+        &self,
+        caller: String,
+        request_id: Option<String>,
+        tx: TxEip1559,
+        dry_run: bool,
+    ) -> Result<CallToolResult, ErrorData> {
+        let id = new_request_id(request_id);
+        self.exec.submit(&caller, &id, tx, dry_run).await.map(to_result).map_err(internal)
     }
 }
 
@@ -307,17 +212,18 @@ impl KeyshareServer {
         };
         let chains = match args.chain_id {
             Some(id) => vec![id],
-            None => self.chains.ids(),
+            None => self.exec.chains.ids(),
         };
         let mut rows = Vec::new();
         for chain_id in chains {
-            let provider = match self.chains.get(chain_id) {
+            let provider = match self.exec.chains.get(chain_id) {
                 Ok(p) => p,
                 Err(r) => return Ok(refused("", r)),
             };
             let mut tokens: Vec<(Option<Address>, u8)> = vec![(None, 18)];
             tokens.extend(
-                self.tokens
+                self.exec
+                    .tokens
                     .iter()
                     .filter(|t| t.chain_id == chain_id && t.token.is_some())
                     .map(|t| (t.token, t.decimals)),
@@ -374,7 +280,7 @@ impl KeyshareServer {
         let decimals = match args.token {
             None => 18,
             Some(token) => {
-                let provider = match self.chains.get(args.chain_id) {
+                let provider = match self.exec.chains.get(args.chain_id) {
                     Ok(p) => p,
                     Err(r) => return Ok(refused("", r)),
                 };
@@ -424,19 +330,32 @@ impl KeyshareServer {
         self.submit(caller, args.request_id, tx, args.dry_run).await
     }
 
-    #[tool(description = "Status of a transaction: pending, confirmed, failed or unknown.")]
+    #[tool(
+        description = "Status of a request or transaction: pending_user_approval, refused, pending, confirmed, failed or unknown."
+    )]
     async fn tx_status(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<TxStatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        caller(&parts)?;
-        let provider = match self.chains.get(args.chain_id) {
+        let caller = caller(&parts)?;
+        let hash = match (args.tx_hash, args.request_id) {
+            (Some(h), _) => h,
+            (None, Some(id)) => match self.exec.request_state(&caller, &id) {
+                Some(RequestState::Broadcast { tx_hash, .. }) => tx_hash,
+                Some(state) => return Ok(CallToolResult::structured(json!(state))),
+                None => return Ok(CallToolResult::structured(json!({ "state": "unknown" }))),
+            },
+            (None, None) => return Ok(bad_args("give tx_hash or request_id")),
+        };
+        let provider = match self.exec.chains.get(args.chain_id) {
             Ok(p) => p,
             Err(r) => return Ok(refused("", r)),
         };
-        match chain::tx_status(provider, args.tx_hash).await {
-            Ok(s) => Ok(CallToolResult::structured(json!(s))),
+        match chain::tx_status(provider, hash).await {
+            Ok(s) => Ok(CallToolResult::structured(
+                json!({ "tx_hash": hash, "state": s.state, "block_number": s.block_number }),
+            )),
             Err(r) => Ok(refused("", r)),
         }
     }
@@ -448,7 +367,8 @@ impl KeyshareServer {
         Parameters(args): Parameters<SignMessageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
-        let (scoped, id) = request_id_for(&caller, args.request_id);
+        let id = new_request_id(args.request_id);
+        let scoped = scoped(&caller, &id);
         self.with_wallet(move |w| match w.sign_message(&caller, &scoped, args.message.as_bytes(), now()) {
             Ok(sig) => CallToolResult::structured(json!({ "request_id": id, "signature": sig })),
             Err(r) => refused(&id, r),
@@ -463,7 +383,8 @@ impl KeyshareServer {
         Parameters(args): Parameters<SignTypedDataArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
-        let (scoped, id) = request_id_for(&caller, args.request_id);
+        let id = new_request_id(args.request_id);
+        let scoped = scoped(&caller, &id);
         let data: TypedData = match serde_json::from_value(args.typed_data) {
             Ok(d) => d,
             Err(e) => {

@@ -11,6 +11,7 @@ use alloy::primitives::{Address, B256, Bytes, Signature};
 use serde::Serialize;
 use serde_json::json;
 
+use crate::approval::{self, Decision};
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::chainlog::LogError;
 use crate::killswitch::KillSwitch;
@@ -24,6 +25,8 @@ use crate::spend::{SpendEntry, SpendLog};
 pub struct Account {
     pub signer: Box<dyn Signer>,
     pub policy: Box<dyn PolicyEngine>,
+    /// Owner admin keys (not shares). They approve held requests (design §15.2).
+    pub admins: Vec<Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +101,52 @@ impl Wallet {
         tx: TxEip1559,
         now: u64,
     ) -> Result<SignedTx, Refusal> {
+        self.sign_tx_inner(caller, request_id, tx, None, now)
+    }
+
+    /// Whether `caller`'s owner has admin keys, so a waivable refusal can be held for approval.
+    pub fn has_admins(&self, caller: &str) -> bool {
+        self.account(caller).is_ok_and(|a| !a.admins.is_empty())
+    }
+
+    /// Checks an owner's decision on a held request and returns the admin key that signed it.
+    pub fn verify_decision(
+        &self,
+        caller: &str,
+        request_id: &str,
+        tx: &TxEip1559,
+        decision: Decision,
+        signature: &Signature,
+    ) -> Result<Address, Refusal> {
+        let msg = approval::message(decision, caller, request_id, approval::intent_hash(tx));
+        approval::verify(&self.account(caller)?.admins, &msg, signature)
+    }
+
+    /// Signs a held request the owner approved. The approval must match this exact request and
+    /// transaction intent. Kill switch, counter anchor, request id and hard policy rules still
+    /// apply, and the spend still counts toward the daily cap.
+    pub fn sign_transaction_approved(
+        &mut self,
+        caller: &str,
+        request_id: &str,
+        tx: TxEip1559,
+        approval: &Signature,
+        now: u64,
+    ) -> Result<SignedTx, Refusal> {
+        let admin = self.verify_decision(caller, request_id, &tx, Decision::Approve, approval)?;
+        self.sign_tx_inner(caller, request_id, tx, Some(admin), now)
+    }
+
+    fn sign_tx_inner(
+        &mut self,
+        caller: &str,
+        request_id: &str,
+        tx: TxEip1559,
+        approved_by: Option<Address>,
+        now: u64,
+    ) -> Result<SignedTx, Refusal> {
         let detail = json!({
+            "approved_by": approved_by,
             "kind": "transaction",
             "chain_id": tx.chain_id,
             "nonce": tx.nonce,
@@ -107,9 +155,10 @@ impl Wallet {
             "input": tx.input,
             "digest": tx.signature_hash(),
         });
-        let sig = self.authorize_and_sign(caller, request_id, Action::Transaction(&tx), detail, now, |s| {
-            s.sign_transaction(&tx)
-        })?;
+        let sig =
+            self.authorize_and_sign(caller, request_id, Action::Transaction(&tx), approved_by, detail, now, |s| {
+                s.sign_transaction(&tx)
+            })?;
         let envelope = TxEnvelope::from(tx.into_signed(sig));
         Ok(SignedTx { hash: *envelope.tx_hash(), raw: envelope.encoded_2718().into() })
     }
@@ -122,7 +171,9 @@ impl Wallet {
         now: u64,
     ) -> Result<Signature, Refusal> {
         let detail = json!({ "kind": "message", "message": String::from_utf8_lossy(message) });
-        self.authorize_and_sign(caller, request_id, Action::Message(message), detail, now, |s| s.sign_message(message))
+        self.authorize_and_sign(caller, request_id, Action::Message(message), None, detail, now, |s| {
+            s.sign_message(message)
+        })
     }
 
     pub fn sign_typed_data(
@@ -133,14 +184,18 @@ impl Wallet {
         now: u64,
     ) -> Result<Signature, Refusal> {
         let detail = json!({ "kind": "typed_data", "primary_type": data.primary_type, "typed_data": data });
-        self.authorize_and_sign(caller, request_id, Action::TypedData(data), detail, now, |s| s.sign_typed_data(data))
+        self.authorize_and_sign(caller, request_id, Action::TypedData(data), None, detail, now, |s| {
+            s.sign_typed_data(data)
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn authorize_and_sign(
         &mut self,
         caller: &str,
         request_id: &str,
         action: Action<'_>,
+        approved_by: Option<Address>,
         detail: serde_json::Value,
         now: u64,
         sign: impl FnOnce(&dyn Signer) -> Result<Signature, crate::signer::SignerError>,
@@ -155,7 +210,7 @@ impl Wallet {
         // No audit entry, no signature.
         self.audit.append(&entry(AuditEvent::Requested, detail)).map_err(internal)?;
 
-        match self.authorize(caller, request_id, action, now) {
+        match self.authorize(caller, request_id, action, approved_by.is_some(), now) {
             Ok(()) => {}
             Err(refusal) => {
                 // The refusal stands even if this write fails.
@@ -178,7 +233,6 @@ impl Wallet {
         }
     }
 
-    /// Every check that can refuse, then the spend record. Nothing here signs.
     /// The same checks as signing, with nothing recorded, logged or signed. For `dry_run` and
     /// to fail fast before simulating (design §4 step 3).
     pub fn preview(&self, caller: &str, action: Action<'_>, now: u64) -> Result<Verdict, Refusal> {
@@ -186,6 +240,19 @@ impl Wallet {
         self.kill.check(caller)?;
         self.spend.check_anchor()?;
         account.policy.check(action, self.spend.spent_24h(caller, now), self.prices.as_ref())
+    }
+
+    /// Appends one audit entry for something outside the signing path (a hold, a denial).
+    pub fn log_event(
+        &mut self,
+        caller: &str,
+        request_id: &str,
+        event: AuditEvent,
+        detail: serde_json::Value,
+        now: u64,
+    ) {
+        let entry = AuditEntry { at: now, request_id: request_id.into(), caller: caller.into(), event, detail };
+        let _ = self.audit.append(&entry);
     }
 
     /// Logs a refusal that happened outside the signing path (e.g. a simulation revert).
@@ -207,9 +274,24 @@ impl Wallet {
         self.prices.as_ref()
     }
 
-    fn authorize(&mut self, caller: &str, request_id: &str, action: Action<'_>, now: u64) -> Result<(), Refusal> {
+    /// Every check that can refuse, then the spend record. Nothing here signs.
+    fn authorize(
+        &mut self,
+        caller: &str,
+        request_id: &str,
+        action: Action<'_>,
+        owner_approved: bool,
+        now: u64,
+    ) -> Result<(), Refusal> {
         self.spend.check_request_id(request_id)?;
-        let verdict = self.preview(caller, action, now)?;
+        let verdict = if owner_approved {
+            let account = self.account(caller)?;
+            self.kill.check(caller)?;
+            self.spend.check_anchor()?;
+            account.policy.check_owner_approved(action, self.prices.as_ref())?
+        } else {
+            self.preview(caller, action, now)?
+        };
         // Recorded on approval, before signing (design §6.4). This also burns the request id.
         self.spend
             .record(SpendEntry {

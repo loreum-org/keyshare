@@ -10,13 +10,20 @@ use axum::Router;
 use axum::body::Body;
 use http::{Request, StatusCode};
 use keyshare_core::Wallet;
+use keyshare_core::{LocalSigner, Signer};
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
+use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const TOKEN: &str = "filltape-test-token";
 const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+/// A second bot whose owner has an admin key, so waivable refusals are held.
+const TRADER_TOKEN: &str = "trader-test-token";
+const TRADER_KEY: &str = "0x8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7f7a8b41de8f";
+const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+const ADMIN_TOKEN: &str = "admin-test-token";
 const USDC: &str = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
 const OWNER: &str = "0x1111111111111111111111111111111111111111";
 const ATTACKER: &str = "0x2222222222222222222222222222222222222222";
@@ -84,6 +91,7 @@ async fn fixture() -> Fixture {
         [server]
         listen = "127.0.0.1:0"
         state_dir = "{state}"
+        admin_token_sha256 = "{admin_hash}"
 
         [[chains]]
         id = 11155111
@@ -117,19 +125,33 @@ async fn fixture() -> Fixture {
         [[bots.filltape.policy.contracts_allow]]
         addr = "{REVERTER}"
         selectors = ["0xdeadbeef"]
+
+        [bots.trader]
+        credential_sha256 = "{trader_hash}"
+        key_env = "TRADER_KEY"
+        admin_keys = ["{admin}"]
+        [bots.trader.policy]
+        chains = [11155111]
+        per_tx_cap_usd = 200
+        daily_cap_usd = 500
+        recipients_allow = ["{OWNER}"]
         "#,
         state = dir.path().join("state").display(),
         hash = token_hash(TOKEN),
+        trader_hash = token_hash(TRADER_TOKEN),
+        admin_hash = token_hash(ADMIN_TOKEN),
+        admin = admin().address(),
     );
     let path = dir.path().join("keyshare.toml");
     std::fs::write(&path, toml).unwrap();
     let config = Config::load(&path).unwrap();
-    let env: HashMap<&str, &str> = [("FILLTAPE_KEY", KEY)].into();
+    let env: HashMap<&str, &str> = [("FILLTAPE_KEY", KEY), ("TRADER_KEY", TRADER_KEY)].into();
     let wallet = Arc::new(Mutex::new(config.wallet(|v| env.get(v).map(|s| s.to_string())).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
     let tokens = Arc::new(config.prices.clone());
-    let app = keyshare_mcp::app(wallet.clone(), chains, tokens, creds, &[]);
+    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, DEFAULT_HOLD_SECS));
+    let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &[]);
     Fixture { app, wallet, sent, _dir: dir }
 }
 
@@ -167,21 +189,33 @@ async fn rpc(
     (status, session, json)
 }
 
+fn admin() -> LocalSigner {
+    LocalSigner::from_hex(ADMIN_KEY).unwrap()
+}
+
 async fn session(app: &Router) -> Option<String> {
+    session_as(app, TOKEN).await
+}
+
+async fn session_as(app: &Router, token: &str) -> Option<String> {
     let init = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}
     });
-    let (status, session, resp) = rpc(app, Some(TOKEN), None, init).await;
+    let (status, session, resp) = rpc(app, Some(token), None, init).await;
     assert_eq!(status, StatusCode::OK, "{resp}");
     let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-    rpc(app, Some(TOKEN), session.as_deref(), note).await;
+    rpc(app, Some(token), session.as_deref(), note).await;
     session
 }
 
 async fn call(app: &Router, session: Option<&str>, tool: &str, args: Value) -> Value {
+    call_as(app, TOKEN, session, tool, args).await
+}
+
+async fn call_as(app: &Router, token: &str, session: Option<&str>, tool: &str, args: Value) -> Value {
     let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": args}});
-    let (status, _, resp) = rpc(app, Some(TOKEN), session, body).await;
+    let (status, _, resp) = rpc(app, Some(token), session, body).await;
     assert_eq!(status, StatusCode::OK, "{resp}");
     resp["result"].clone()
 }
@@ -362,4 +396,119 @@ async fn unconfigured_chain_is_refused() {
     let s = session(&f.app).await;
     let out = call(&f.app, s.as_deref(), "send", json!({"chain_id": 1, "to": OWNER, "amount": "1"})).await;
     assert_eq!(code(&out), "CHAIN_NOT_ALLOWED");
+}
+
+async fn admin_http(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let body = body.map_or(Body::empty(), |b| Body::from(b.to_string()));
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Holds an over-allowlist send from `trader` and returns its request id and the pending entry.
+async fn hold_one(f: &Fixture, s: Option<&str>) -> (String, Value) {
+    let args = json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": "held-1"});
+    let out = call_as(&f.app, TRADER_TOKEN, s, "send", args).await;
+    assert_eq!(out["structuredContent"]["state"], "pending_user_approval", "{out}");
+    assert_eq!(out["structuredContent"]["reason"]["code"], "RECIPIENT_NOT_ALLOWED");
+    let (status, list) = admin_http(&f.app, "GET", "/admin/pending", Some(ADMIN_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    (out["structuredContent"]["request_id"].as_str().unwrap().to_string(), list["pending"][0].clone())
+}
+
+#[tokio::test]
+async fn owner_approves_a_held_send() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let (id, pending) = hold_one(&f, s.as_deref()).await;
+    assert!(f.sent.lock().unwrap().is_empty());
+    let st =
+        call_as(&f.app, TRADER_TOKEN, s.as_deref(), "tx_status", json!({"chain_id": 11155111, "request_id": id})).await;
+    assert_eq!(st["structuredContent"]["state"], "pending_user_approval");
+
+    let sig = admin().sign_message(pending["approve_message"].as_str().unwrap().as_bytes()).unwrap();
+    let body = json!({"bot": "trader", "request_id": id, "decision": "approve", "signature": sig});
+    let (status, out) = admin_http(&f.app, "POST", "/admin/decide", None, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["approved_by"], json!(admin().address()));
+    assert_eq!(f.sent.lock().unwrap().len(), 1);
+
+    let st =
+        call_as(&f.app, TRADER_TOKEN, s.as_deref(), "tx_status", json!({"chain_id": 11155111, "request_id": id})).await;
+    assert_eq!(st["structuredContent"]["state"], "confirmed");
+    // The approval can't be used twice.
+    let (status, out) = admin_http(&f.app, "POST", "/admin/decide", None, Some(body)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(out["code"], "BAD_APPROVAL");
+    assert_eq!(f.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn owner_denies_a_held_send() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let (id, pending) = hold_one(&f, s.as_deref()).await;
+    let sig = admin().sign_message(pending["deny_message"].as_str().unwrap().as_bytes()).unwrap();
+    let body = json!({"bot": "trader", "request_id": id, "decision": "deny", "signature": sig});
+    let (_, out) = admin_http(&f.app, "POST", "/admin/decide", None, Some(body)).await;
+    assert_eq!(out["code"], "USER_DENIED");
+    let st =
+        call_as(&f.app, TRADER_TOKEN, s.as_deref(), "tx_status", json!({"chain_id": 11155111, "request_id": id})).await;
+    assert_eq!(st["structuredContent"]["state"], "refused");
+    assert!(f.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn only_the_owner_can_decide() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let (id, pending) = hold_one(&f, s.as_deref()).await;
+    let msg = pending["approve_message"].as_str().unwrap().as_bytes().to_vec();
+
+    // A stranger's key, or the owner's signature on a deny used as an approve, is refused.
+    let stranger = LocalSigner::random().sign_message(&msg).unwrap();
+    let deny_sig = admin().sign_message(pending["deny_message"].as_str().unwrap().as_bytes()).unwrap();
+    for sig in [stranger, deny_sig] {
+        let body = json!({"bot": "trader", "request_id": id, "decision": "approve", "signature": sig});
+        let (status, out) = admin_http(&f.app, "POST", "/admin/decide", None, Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(out["code"], "BAD_APPROVAL");
+    }
+    assert!(f.sent.lock().unwrap().is_empty());
+
+    // Listing needs the admin token; bot tokens don't work.
+    assert_eq!(admin_http(&f.app, "GET", "/admin/pending", None, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(admin_http(&f.app, "GET", "/admin/pending", Some(TRADER_TOKEN), None).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn hard_rules_are_never_held() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let out = call_as(
+        &f.app,
+        TRADER_TOKEN,
+        s.as_deref(),
+        "send",
+        json!({"chain_id": 11155111, "to": OWNER, "amount": "1", "dry_run": false}),
+    )
+    .await;
+    // 1 ETH = $2500 is over the cap: held, not refused.
+    assert_eq!(out["structuredContent"]["state"], "pending_user_approval");
+    f.wallet.lock().unwrap().kill_switch().set(None, true).unwrap();
+    let out =
+        call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", json!({"chain_id": 11155111, "to": OWNER, "amount": "1"}))
+            .await;
+    assert_eq!(code(&out), "KILL_SWITCH");
 }

@@ -37,6 +37,11 @@ pub trait PolicyEngine: Send + Sync {
     /// `spent_24h` is the caller's rolling 24h spend from this signer's own counter (§6.4).
     fn check(&self, action: Action<'_>, spent_24h: UsdMicros, prices: &dyn PriceSource) -> Result<Verdict, Refusal>;
 
+    /// The check for a request the wallet's owner approved with an admin key (design §13.2).
+    /// Owner-waivable rules (allowlists, caps, the co-sign threshold) are skipped; hard rules
+    /// (chains, denied primitives, pricing) still apply. Only transactions can be approved.
+    fn check_owner_approved(&self, action: Action<'_>, prices: &dyn PriceSource) -> Result<Verdict, Refusal>;
+
     /// What the caller may see about its own limits (the `limits` tool). Allowlists are counted,
     /// not listed.
     fn limits(&self) -> Limits;
@@ -74,6 +79,9 @@ pub struct PlainPolicy {
     /// EIP-712 primary types this bot may sign, e.g. "HyperliquidTransaction:UsdSend".
     #[serde(default)]
     pub typed_data_allow: Vec<String>,
+    /// Sends worth more than this (whole USD) need the owner's approval even inside the caps.
+    #[serde(default)]
+    pub require_admin_cosign_above_usd: Option<u64>,
 }
 
 fn refuse(code: RefusalCode, reason: impl Into<String>) -> Refusal {
@@ -89,8 +97,8 @@ impl PlainPolicy {
         }
     }
 
-    fn check_recipient(&self, to: Address) -> Result<(), Refusal> {
-        if self.recipients_allow.contains(&to) {
+    fn check_recipient(&self, to: Address, approved: bool) -> Result<(), Refusal> {
+        if approved || self.recipients_allow.contains(&to) {
             Ok(())
         } else {
             Err(refuse(RefusalCode::RecipientNotAllowed, format!("recipient {to} is not allowlisted")))
@@ -116,7 +124,12 @@ impl PlainPolicy {
     }
 
     /// Static rules for a transaction. Returns its USD outflow.
-    fn check_transaction(&self, tx: &TxEip1559, prices: &dyn PriceSource) -> Result<UsdMicros, Refusal> {
+    fn check_transaction(
+        &self,
+        tx: &TxEip1559,
+        prices: &dyn PriceSource,
+        approved: bool,
+    ) -> Result<UsdMicros, Refusal> {
         self.check_chain(tx.chain_id)?;
         let TxKind::Call(to) = tx.to else {
             return Err(refuse(RefusalCode::ContractNotAllowed, "contract creation is not allowed"));
@@ -125,7 +138,7 @@ impl PlainPolicy {
         let data = tx.input.as_ref();
 
         if data.is_empty() {
-            self.check_recipient(to)?;
+            self.check_recipient(to, approved)?;
             return Ok(native);
         }
 
@@ -137,14 +150,14 @@ impl PlainPolicy {
         if selector == setApprovalForAllCall::SELECTOR {
             return Err(refuse(RefusalCode::DeniedPrimitive, "setApprovalForAll is always denied"));
         }
-        if !self.contract_allows(to, selector) {
+        if !approved && !self.contract_allows(to, selector) {
             return Err(refuse(RefusalCode::ContractNotAllowed, format!("call {selector} on {to} is not allowlisted")));
         }
 
         let token_outflow = if selector == transferCall::SELECTOR {
             let call = transferCall::abi_decode(data)
                 .map_err(|e| refuse(RefusalCode::ContractNotAllowed, format!("bad transfer calldata: {e}")))?;
-            self.check_recipient(call.to)?;
+            self.check_recipient(call.to, approved)?;
             Self::price(prices, tx.chain_id, Some(to), call.amount)?
         } else if selector == approveCall::SELECTOR {
             let call = approveCall::abi_decode(data)
@@ -152,7 +165,7 @@ impl PlainPolicy {
             if call.amount == U256::MAX {
                 return Err(refuse(RefusalCode::DeniedPrimitive, "unlimited approve is denied"));
             }
-            if !self.is_allowlisted_contract(call.spender) {
+            if !approved && !self.is_allowlisted_contract(call.spender) {
                 return Err(refuse(
                     RefusalCode::ContractNotAllowed,
                     format!("approve spender {} is not an allowlisted contract", call.spender),
@@ -200,10 +213,19 @@ impl PlainPolicy {
     }
 }
 
-impl PolicyEngine for PlainPolicy {
-    fn check(&self, action: Action<'_>, spent_24h: UsdMicros, prices: &dyn PriceSource) -> Result<Verdict, Refusal> {
+impl PlainPolicy {
+    fn evaluate(
+        &self,
+        action: Action<'_>,
+        spent_24h: UsdMicros,
+        prices: &dyn PriceSource,
+        approved: bool,
+    ) -> Result<Verdict, Refusal> {
         let outflow_usd = match action {
-            Action::Transaction(tx) => self.check_transaction(tx, prices)?,
+            Action::Transaction(tx) => self.check_transaction(tx, prices, approved)?,
+            Action::Message(_) | Action::TypedData(_) if approved => {
+                return Err(refuse(RefusalCode::BadApproval, "only transactions can be owner-approved"));
+            }
             Action::Message(m) => {
                 Self::check_message(m)?;
                 0
@@ -213,6 +235,9 @@ impl PolicyEngine for PlainPolicy {
                 0
             }
         };
+        if approved {
+            return Ok(Verdict { outflow_usd });
+        }
 
         let per_tx = UsdMicros::from(self.per_tx_cap_usd) * MICROS_PER_USD;
         if outflow_usd > per_tx {
@@ -233,7 +258,25 @@ impl PolicyEngine for PlainPolicy {
                 ),
             ));
         }
+        if let Some(limit) = self.require_admin_cosign_above_usd
+            && outflow_usd > UsdMicros::from(limit) * MICROS_PER_USD
+        {
+            return Err(refuse(
+                RefusalCode::AdminApprovalRequired,
+                format!("${} is over ${limit}, which needs the owner's approval", usd(outflow_usd)),
+            ));
+        }
         Ok(Verdict { outflow_usd })
+    }
+}
+
+impl PolicyEngine for PlainPolicy {
+    fn check(&self, action: Action<'_>, spent_24h: UsdMicros, prices: &dyn PriceSource) -> Result<Verdict, Refusal> {
+        self.evaluate(action, spent_24h, prices, false)
+    }
+
+    fn check_owner_approved(&self, action: Action<'_>, prices: &dyn PriceSource) -> Result<Verdict, Refusal> {
+        self.evaluate(action, 0, prices, true)
     }
 
     fn limits(&self) -> Limits {
@@ -378,6 +421,33 @@ mod tests {
         let data = transferCall { to: FRIEND, amount: U256::from(1) }.abi_encode();
         let r = p.check(Action::Transaction(&tx(other, U256::ZERO, data)), 0, &prices());
         assert_eq!(code(r), RefusalCode::PriceUnavailable);
+    }
+
+    #[test]
+    fn owner_approval_waives_soft_rules_only() {
+        let p = policy();
+        let ok = |t: &TxEip1559| p.check_owner_approved(Action::Transaction(t), &prices());
+        // Unlisted recipient and over the caps: fine once the owner approves; outflow still counted.
+        assert_eq!(ok(&usdc_transfer(STRANGER, 1_000)).unwrap().outflow_usd, 1_000 * MICROS_PER_USD);
+        assert!(ok(&tx(STRANGER, U256::ZERO, vec![1, 2, 3, 4])).is_ok());
+        // Hard rules still hold.
+        let mut wrong_chain = tx(FRIEND, eth(1), vec![]);
+        wrong_chain.chain_id = 1;
+        assert_eq!(code(ok(&wrong_chain)), RefusalCode::ChainNotAllowed);
+        let unlimited = approveCall { spender: ROUTER, amount: U256::MAX }.abi_encode();
+        assert_eq!(code(ok(&tx(USDC, U256::ZERO, unlimited))), RefusalCode::DeniedPrimitive);
+        let nft = setApprovalForAllCall { operator: STRANGER, approved: true }.abi_encode();
+        assert_eq!(code(ok(&tx(USDC, U256::ZERO, nft))), RefusalCode::DeniedPrimitive);
+        assert_eq!(code(p.check_owner_approved(Action::Message(b"hi"), &prices())), RefusalCode::BadApproval);
+    }
+
+    #[test]
+    fn cosign_threshold_needs_owner() {
+        let mut p = policy();
+        p.require_admin_cosign_above_usd = Some(100);
+        assert!(p.check(Action::Transaction(&usdc_transfer(FRIEND, 100)), 0, &prices()).is_ok());
+        let r = p.check(Action::Transaction(&usdc_transfer(FRIEND, 101)), 0, &prices());
+        assert_eq!(code(r), RefusalCode::AdminApprovalRequired);
     }
 
     #[test]

@@ -9,6 +9,10 @@ allowed_hosts = []
 state_dir = "./state"
 # Copy of the spend-log head. Put it on another disk so a restored disk image is caught.
 # spend_anchor = "/mnt/anchor/spend.anchor.json"
+# Token for GET /admin/pending (sha256, from `keyshare-mcp new-token`). Without it the list is off.
+# admin_token_sha256 = "0x..."
+# How long a held request waits for the owner (seconds). Default 900.
+# hold_secs = 900
 
 # RPC per chain. Chain tools refuse chains not listed here.
 [[chains]]
@@ -30,6 +34,9 @@ usd = "1"
 [bots.filltape]
 credential_sha256 = "0x0000000000000000000000000000000000000000000000000000000000000000"
 key_env = "FILLTAPE_KEY"
+# Owner admin keys. With one set, over-limit or unlisted sends wait for the owner's signed
+# approval (POST /admin/decide) instead of being refused.
+admin_keys = []
 
 [bots.filltape.policy]
 chains = [11155111]
@@ -37,6 +44,7 @@ per_tx_cap_usd = 200
 daily_cap_usd = 500
 recipients_allow = []
 typed_data_allow = []
+# require_admin_cosign_above_usd = 100   # owner approves anything above this, even inside the caps
 
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"

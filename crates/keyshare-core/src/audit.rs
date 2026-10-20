@@ -11,6 +11,8 @@ use crate::chainlog::{ChainLog, Head, LogError};
 #[serde(rename_all = "snake_case")]
 pub enum AuditEvent {
     Requested,
+    /// Held for the owner's approval.
+    Held,
     Refused,
     Signed,
 }

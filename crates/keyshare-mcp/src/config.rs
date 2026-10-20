@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
 use serde::Deserialize;
@@ -35,6 +35,10 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
     /// Copy of the spend log head, ideally on another disk. Defaults to inside `state_dir`.
     pub spend_anchor: Option<PathBuf>,
+    /// SHA-256 of the token for `GET /admin/pending`. Without it that endpoint is off.
+    pub admin_token_sha256: Option<B256>,
+    /// How long a held request waits for the owner. Default 15 minutes.
+    pub hold_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +48,10 @@ pub struct BotConfig {
     pub credential_sha256: B256,
     /// Environment variable holding this bot's testnet private key.
     pub key_env: String,
+    /// The owner's admin keys (Ethereum addresses). With at least one, refusals the owner can
+    /// waive are held for approval instead of refused (design §13.2).
+    #[serde(default)]
+    pub admin_keys: Vec<Address>,
     pub policy: PlainPolicy,
 }
 
@@ -98,7 +106,14 @@ impl Config {
                 .ok_or_else(|| ConfigError::MissingKey { bot: bot.clone(), var: cfg.key_env.clone() })?;
             let signer = LocalSigner::from_hex(&key)
                 .map_err(|e| ConfigError::BadKey { bot: bot.clone(), why: e.to_string() })?;
-            accounts.insert(bot.clone(), Account { signer: Box::new(signer), policy: Box::new(cfg.policy.clone()) });
+            accounts.insert(
+                bot.clone(),
+                Account {
+                    signer: Box::new(signer),
+                    policy: Box::new(cfg.policy.clone()),
+                    admins: cfg.admin_keys.clone(),
+                },
+            );
         }
         let prices = PriceTable::from_entries(&self.prices).map_err(|e| ConfigError::Other(e.to_string()))?;
         std::fs::create_dir_all(&self.server.state_dir)
