@@ -13,9 +13,13 @@ Full design: [docs/design.md](docs/design.md).
 | Crate | What it does |
 |---|---|
 | `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path that ties them together. |
+| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `sign_message`, `sign_typed_data`. |
 
 ```sh
 cargo test
+keyshare-mcp new-token                                  # bot token + hash for the config
+FILLTAPE_KEY=0x... keyshare-mcp serve keyshare.example.toml
+keyshare-mcp freeze keyshare.example.toml [bot]         # kill switch
 ```
 
 ## What it is
