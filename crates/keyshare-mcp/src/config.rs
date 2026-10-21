@@ -84,6 +84,12 @@ impl Config {
         toml::from_str(&text).map_err(|e| ConfigError::Parse(path.into(), e))
     }
 
+    /// True when the spend anchor sits inside `state_dir`, where restoring or deleting that one
+    /// directory would defeat the rollback check.
+    pub fn anchor_in_state_dir(&self) -> bool {
+        self.server.spend_anchor.as_ref().is_none_or(|a| a.starts_with(&self.server.state_dir))
+    }
+
     pub fn state_paths(&self) -> StatePaths {
         let dir = &self.server.state_dir;
         StatePaths {
@@ -98,6 +104,10 @@ impl Config {
     pub fn credentials(&self) -> Result<HashMap<B256, String>, ConfigError> {
         let mut out = HashMap::new();
         for (bot, cfg) in &self.bots {
+            // Request ids are scoped as "bot:id"; a ':' in a bot id could collide with another's.
+            if bot.is_empty() || bot.contains(':') {
+                return Err(ConfigError::Other(format!("bot id {bot:?} must be non-empty and contain no ':'")));
+            }
             if let Some(other) = out.insert(cfg.credential_sha256, bot.clone()) {
                 return Err(ConfigError::DuplicateCredential(other, bot.clone()));
             }

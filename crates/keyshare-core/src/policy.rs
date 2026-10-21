@@ -76,6 +76,61 @@ pub struct ContractRule {
     pub selectors: Vec<Selector>,
 }
 
+/// One allowlisted kind of EIP-712 payload. It must name the domain's `verifying_contract` or
+/// `name` (or both), so another protocol's `Order` doesn't match. Typed data with no `chainId`
+/// in its domain matches only a rule marked `chainless`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedDataRule {
+    pub primary_type: String,
+    pub verifying_contract: Option<Address>,
+    pub name: Option<String>,
+    /// Required chain. Default: any of the policy's chains.
+    pub chain_id: Option<u64>,
+    #[serde(default)]
+    pub chainless: bool,
+}
+
+impl TypedDataRule {
+    fn matches(&self, data: &TypedData) -> bool {
+        let d = &data.domain;
+        let bound = self.verifying_contract.is_some() || self.name.is_some();
+        let chain_ok = match (d.chain_id, self.chain_id) {
+            (None, _) => self.chainless,
+            (Some(c), Some(want)) => c == U256::from(want),
+            (Some(_), None) => true,
+        };
+        bound
+            && chain_ok
+            && self.primary_type == data.primary_type
+            && self.verifying_contract.is_none_or(|v| d.verifying_contract == Some(v))
+            && self.name.as_deref().is_none_or(|n| d.name.as_deref() == Some(n))
+    }
+}
+
+/// Typed data that moves funds: never signed as raw typed data, because the policy can't value
+/// it against the caps. Hyperliquid user-signed actions go through the `hl_*` tools instead.
+fn moves_funds(primary_type: &str) -> bool {
+    primary_type.starts_with("HyperliquidTransaction:")
+        || matches!(
+            primary_type,
+            "Permit"
+                | "PermitSingle"
+                | "PermitBatch"
+                | "PermitTransferFrom"
+                | "PermitBatchTransferFrom"
+                | "PermitWitnessTransferFrom"
+                | "PermitBatchWitnessTransferFrom"
+        )
+}
+
+/// Token functions that move or grant funds in ways the policy doesn't decode yet.
+const UNDECODED_TOKEN_SELECTORS: [[u8; 4]; 3] = [
+    [0x23, 0xb8, 0x72, 0xdd], // transferFrom
+    [0x39, 0x50, 0x93, 0x51], // increaseAllowance
+    [0xd5, 0x05, 0xac, 0xcf], // permit
+];
+
 /// Deny-by-default rules for one bot's wallet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,9 +144,9 @@ pub struct PlainPolicy {
     pub recipients_allow: Vec<Address>,
     #[serde(default)]
     pub contracts_allow: Vec<ContractRule>,
-    /// EIP-712 primary types this bot may sign, e.g. "HyperliquidTransaction:UsdSend".
+    /// EIP-712 payloads this bot may sign, each bound to a primary type and its domain.
     #[serde(default)]
-    pub typed_data_allow: Vec<String>,
+    pub typed_data_allow: Vec<TypedDataRule>,
     /// Sends worth more than this (whole USD) need the owner's approval even inside the caps.
     #[serde(default)]
     pub require_admin_cosign_above_usd: Option<u64>,
@@ -179,6 +234,9 @@ impl PlainPolicy {
                 .ok_or_else(|| refuse(RefusalCode::ContractNotAllowed, "calldata shorter than a function selector"))?,
         );
 
+        if UNDECODED_TOKEN_SELECTORS.contains(&selector.0) {
+            return Err(refuse(RefusalCode::DeniedPrimitive, format!("{selector} can move funds the caps don't see")));
+        }
         if selector == setApprovalForAllCall::SELECTOR {
             return Err(refuse(RefusalCode::DeniedPrimitive, "setApprovalForAll is always denied"));
         }
@@ -259,17 +317,23 @@ impl PlainPolicy {
     }
 
     fn check_typed_data(&self, data: &TypedData) -> Result<(), Refusal> {
+        if moves_funds(&data.primary_type) {
+            return Err(refuse(
+                RefusalCode::DeniedPrimitive,
+                format!("typed data {:?} moves funds outside the caps", data.primary_type),
+            ));
+        }
         if let Some(chain) = data.domain.chain_id {
             let chain = u64::try_from(chain)
                 .map_err(|_| refuse(RefusalCode::ChainNotAllowed, "typed-data chainId out of range"))?;
             self.check_chain(chain)?;
         }
-        if self.typed_data_allow.contains(&data.primary_type) {
+        if self.typed_data_allow.iter().any(|r| r.matches(data)) {
             Ok(())
         } else {
             Err(refuse(
                 RefusalCode::TypedDataNotAllowed,
-                format!("typed data {:?} is not allowlisted", data.primary_type),
+                format!("typed data {:?} with this domain is not allowlisted", data.primary_type),
             ))
         }
     }
@@ -377,7 +441,10 @@ mod tests {
             per_tx_cap_usd = 200
             daily_cap_usd = 500
             recipients_allow = ["{FRIEND}"]
-            typed_data_allow = ["Order"]
+            [[typed_data_allow]]
+            primary_type = "Order"
+            verifying_contract = "{ROUTER}"
+            chain_id = {CHAIN}
 
             [[contracts_allow]]
             addr = "{USDC}"
@@ -500,6 +567,12 @@ mod tests {
 
     #[test]
     fn approvals_are_bounded() {
+        let pull = [[0x23, 0xb8, 0x72, 0xdd].as_slice(), &[0u8; 96]].concat();
+        assert_eq!(
+            code(check(&tx(USDC, U256::ZERO, pull), 0)),
+            RefusalCode::DeniedPrimitive,
+            "transferFrom is refused even on an allowlisted token"
+        );
         let unlimited = approveCall { spender: ROUTER, amount: U256::MAX }.abi_encode();
         assert_eq!(code(check(&tx(USDC, U256::ZERO, unlimited), 0)), RefusalCode::DeniedPrimitive);
         let to_stranger = approveCall { spender: STRANGER, amount: U256::from(1) }.abi_encode();
@@ -558,23 +631,34 @@ mod tests {
     #[test]
     fn typed_data_is_deny_by_default() {
         let p = policy();
-        let make = |primary: &str, chain: u64| -> TypedData {
+        let make = |primary: &str, domain: serde_json::Value| -> TypedData {
             serde_json::from_value(serde_json::json!({
                 "types": {
-                    "EIP712Domain": [{"name": "chainId", "type": "uint256"}],
+                    "EIP712Domain": [{"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
                     primary: [{"name": "amount", "type": "uint256"}]
                 },
                 "primaryType": primary,
-                "domain": {"chainId": chain},
+                "domain": domain,
                 "message": {"amount": "1"}
             }))
             .expect("typed data")
         };
-        assert!(p.check(Action::TypedData(&make("Order", CHAIN)), 0, &prices()).is_ok());
+        let ok = serde_json::json!({"chainId": CHAIN, "verifyingContract": ROUTER});
+        let check = |d: &TypedData| p.check(Action::TypedData(d), 0, &prices()).map_err(|r| r.code);
+        assert!(check(&make("Order", ok.clone())).is_ok());
+        assert_eq!(check(&make("Permit", ok.clone())), Err(RefusalCode::DeniedPrimitive));
+        assert_eq!(check(&make("HyperliquidTransaction:UsdSend", ok)), Err(RefusalCode::DeniedPrimitive));
+        // Same type name, another protocol's contract.
+        let other = serde_json::json!({"chainId": CHAIN, "verifyingContract": STRANGER});
+        assert_eq!(check(&make("Order", other)), Err(RefusalCode::TypedDataNotAllowed));
+        // No chainId: only a chainless rule matches.
         assert_eq!(
-            code(p.check(Action::TypedData(&make("Permit", CHAIN)), 0, &prices())),
-            RefusalCode::TypedDataNotAllowed
+            check(&make("Order", serde_json::json!({"verifyingContract": ROUTER}))),
+            Err(RefusalCode::TypedDataNotAllowed)
         );
-        assert_eq!(code(p.check(Action::TypedData(&make("Order", 1)), 0, &prices())), RefusalCode::ChainNotAllowed);
+        assert_eq!(
+            check(&make("Order", serde_json::json!({"chainId": 1, "verifyingContract": ROUTER}))),
+            Err(RefusalCode::ChainNotAllowed)
+        );
     }
 }
