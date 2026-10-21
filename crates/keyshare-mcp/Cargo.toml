@@ -1,0 +1,28 @@
+[package]
+name = "keyshare-mcp"
+description = "MCP connector for keyshare wallets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keyshare-core = { path = "../keyshare-core" }
+alloy.workspace = true
+axum = "0.8"
+http = "1"
+rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

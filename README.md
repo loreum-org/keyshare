@@ -2,11 +2,25 @@
 
 A threshold-signing wallet for humans and agents. The signing key is a plain EOA from a 2-of-3 distributed key generation, so the full private key never exists. Each signer node enforces policy in plain Rust. ZK proofs are a later option, not part of v1. There is no Safe or smart-account layer.
 
-**Status:** design phase. Draft v0.1 (Oct 18, 2026). Phase 0 has not started. This repository is documentation only.
+**Status:** Phase 0 (testnet MVP) in progress. Design draft v0.1 (Oct 18, 2026).
 
 **License:** TBD
 
 Full design: [docs/design.md](docs/design.md).
+
+## Code
+
+| Crate | What it does |
+|---|---|
+| `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path that ties them together. |
+| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `sign_message`, `sign_typed_data`. |
+
+```sh
+cargo test
+keyshare-mcp new-token                                  # bot token + hash for the config
+FILLTAPE_KEY=0x... keyshare-mcp serve keyshare.example.toml
+keyshare-mcp freeze keyshare.example.toml [bot]         # kill switch
+```
 
 ## What it is
 
@@ -84,7 +98,7 @@ flowchart LR
 
 | Phase | Scope |
 |---|---|
-| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-Rust policy, audit log, kill switch. No ZK proofs. **Not started.** |
+| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-Rust policy, audit log, kill switch. No ZK proofs. **In progress.** |
 | **1 — Interim production** (optional) | Same API, vendor policy-enforced keys (Turnkey, or Privy/CDP). Small mainnet balances. |
 | **2 — Own TSS network** | DKLs23 2-of-3. Each node enforces policy in plain Rust. Human wallet app, owner admin model. |
 | **3 — Chamber offering** (optional) | Signer network and plain-Rust policy for DAO and agent treasuries. |

@@ -28,3 +28,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# keyshare-mcp runtime state
+state/
