@@ -309,9 +309,13 @@ impl Hyperliquid {
         if hl::decimals(&s) > asset.sz_decimals {
             return Err(bad_args(format!("{} sizes have at most {} decimals", o.coin, asset.sz_decimals)));
         }
-        // Reading the account also sets the day's loss baseline, reduce-only orders included.
-        let (value, szi) = self.account(master, &o.coin).await?;
-        let loss = self.loss_today(bot, value)?;
+        // Reading the account also sets the day's loss baseline. A reduce-only order only shrinks
+        // risk, so a failed read or baseline write never blocks it.
+        let read = async {
+            let (value, szi) = self.account(master, &o.coin).await?;
+            Ok::<_, Refusal>((szi, self.loss_today(bot, value)?))
+        };
+        let (szi, loss) = if o.reduce_only { read.await.unwrap_or((0, 0)) } else { read.await? };
         let (value_px, position_after, leverage) = if o.reduce_only {
             (px, 0, 0)
         } else {
