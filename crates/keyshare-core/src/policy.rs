@@ -76,9 +76,10 @@ pub struct ContractRule {
     pub selectors: Vec<Selector>,
 }
 
-/// One allowlisted kind of EIP-712 payload. It must name the domain's `verifying_contract` or
-/// `name` (or both), so another protocol's `Order` doesn't match. Typed data with no `chainId`
-/// in its domain matches only a rule marked `chainless`.
+/// One allowlisted kind of EIP-712 payload. It must name the domain's `verifying_contract`, so
+/// another protocol's `Order` doesn't match. A domain `name` alone is enough only for domains
+/// with no `chainId` (and so a `chainless` rule), since any contract can declare any name. Typed data with no `chainId` in its
+/// domain matches only a rule marked `chainless`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypedDataRule {
@@ -94,7 +95,7 @@ pub struct TypedDataRule {
 impl TypedDataRule {
     fn matches(&self, data: &TypedData) -> bool {
         let d = &data.domain;
-        let bound = self.verifying_contract.is_some() || self.name.is_some();
+        let bound = self.verifying_contract.is_some() || (self.name.is_some() && d.chain_id.is_none());
         let chain_ok = match (d.chain_id, self.chain_id) {
             (None, _) => self.chainless,
             (Some(c), Some(want)) => c == U256::from(want),
@@ -125,10 +126,15 @@ fn moves_funds(primary_type: &str) -> bool {
 }
 
 /// Token functions that move or grant funds in ways the policy doesn't decode yet.
-const UNDECODED_TOKEN_SELECTORS: [[u8; 4]; 3] = [
-    [0x23, 0xb8, 0x72, 0xdd], // transferFrom
+const UNDECODED_TOKEN_SELECTORS: [[u8; 4]; 8] = [
+    [0x23, 0xb8, 0x72, 0xdd], // transferFrom (ERC-20 and ERC-721)
     [0x39, 0x50, 0x93, 0x51], // increaseAllowance
-    [0xd5, 0x05, 0xac, 0xcf], // permit
+    [0xd5, 0x05, 0xac, 0xcf], // permit (EIP-2612)
+    [0x8f, 0xcb, 0xaf, 0x0c], // permit (DAI)
+    [0x42, 0x84, 0x2e, 0x0e], // safeTransferFrom(address,address,uint256)
+    [0xb8, 0x8d, 0x4f, 0xde], // safeTransferFrom(address,address,uint256,bytes)
+    [0xf2, 0x42, 0x43, 0x2a], // safeTransferFrom (ERC-1155)
+    [0x2e, 0xb2, 0xc2, 0xd6], // safeBatchTransferFrom (ERC-1155)
 ];
 
 /// Deny-by-default rules for one bot's wallet.
@@ -660,5 +666,45 @@ mod tests {
             check(&make("Order", serde_json::json!({"chainId": 1, "verifyingContract": ROUTER}))),
             Err(RefusalCode::ChainNotAllowed)
         );
+    }
+
+    #[test]
+    fn name_only_rule_needs_chainless() {
+        let rule = |chainless| TypedDataRule {
+            primary_type: "Order".into(),
+            verifying_contract: None,
+            name: Some("Exchange".into()),
+            chain_id: None,
+            chainless,
+        };
+        let data = |domain: serde_json::Value| -> TypedData {
+            serde_json::from_value(serde_json::json!({
+                "types": {"EIP712Domain": [], "Order": [{"name": "amount", "type": "uint256"}]},
+                "primaryType": "Order",
+                "domain": domain,
+                "message": {"amount": "1"}
+            }))
+            .expect("typed data")
+        };
+        // Any contract can call itself "Exchange", so a name-only rule never matches a chain domain.
+        let spoof = data(serde_json::json!({"name": "Exchange", "chainId": CHAIN, "verifyingContract": STRANGER}));
+        assert!(!rule(false).matches(&spoof));
+        assert!(!rule(true).matches(&spoof));
+        assert!(rule(true).matches(&data(serde_json::json!({"name": "Exchange"}))));
+    }
+
+    #[test]
+    fn undecoded_selectors_cover_nft_and_dai_permit() {
+        use alloy::primitives::keccak256;
+        for sig in [
+            "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)",
+            "safeTransferFrom(address,address,uint256)",
+            "safeTransferFrom(address,address,uint256,bytes)",
+            "safeTransferFrom(address,address,uint256,uint256,bytes)",
+            "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+        ] {
+            let sel: [u8; 4] = keccak256(sig)[..4].try_into().unwrap();
+            assert!(UNDECODED_TOKEN_SELECTORS.contains(&sel), "{sig}");
+        }
     }
 }
