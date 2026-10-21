@@ -6,7 +6,7 @@ use alloy::dyn_abi::TypedData;
 use alloy::primitives::{Address, FixedBytes, TxKind, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::price::{MICROS_PER_USD, PriceSource, UsdMicros};
 use crate::refusal::{Refusal, RefusalCode};
@@ -36,6 +36,20 @@ pub struct Verdict {
 pub trait PolicyEngine: Send + Sync {
     /// `spent_24h` is the caller's rolling 24h spend from this signer's own counter (§6.4).
     fn check(&self, action: Action<'_>, spent_24h: UsdMicros, prices: &dyn PriceSource) -> Result<Verdict, Refusal>;
+
+    /// What the caller may see about its own limits (the `limits` tool). Allowlists are counted,
+    /// not listed.
+    fn limits(&self) -> Limits;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Limits {
+    pub chains: Vec<u64>,
+    pub per_tx_cap_usd: u64,
+    pub daily_cap_usd: u64,
+    pub recipients_allowed: usize,
+    pub contracts_allowed: usize,
+    pub typed_data_allowed: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,6 +234,17 @@ impl PolicyEngine for PlainPolicy {
             ));
         }
         Ok(Verdict { outflow_usd })
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            chains: self.chains.clone(),
+            per_tx_cap_usd: self.per_tx_cap_usd,
+            daily_cap_usd: self.daily_cap_usd,
+            recipients_allowed: self.recipients_allow.len(),
+            contracts_allowed: self.contracts_allow.len(),
+            typed_data_allowed: self.typed_data_allow.len(),
+        }
     }
 }
 

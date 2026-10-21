@@ -1,0 +1,38 @@
+# keyshare-mcp config (Phase 0, testnet only).
+# Run:  FILLTAPE_KEY=0x... keyshare-mcp serve keyshare.example.toml
+# Make a bot token:  keyshare-mcp new-token
+
+[server]
+listen = "127.0.0.1:8080"
+# Host headers to accept. Add your Railway domain in production. Empty = localhost only.
+allowed_hosts = []
+state_dir = "./state"
+# Copy of the spend-log head. Put it on another disk so a restored disk image is caught.
+# spend_anchor = "/mnt/anchor/spend.anchor.json"
+
+# Fixed USD prices for caps (Phase 0). Tokens with no price are refused.
+[[prices]]
+chain_id = 11155111            # Sepolia ETH
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia USDC
+token = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+decimals = 6
+usd = "1"
+
+[bots.filltape]
+credential_sha256 = "0x0000000000000000000000000000000000000000000000000000000000000000"
+key_env = "FILLTAPE_KEY"
+
+[bots.filltape.policy]
+chains = [11155111]
+per_tx_cap_usd = 200
+daily_cap_usd = 500
+recipients_allow = []
+typed_data_allow = []
+
+[[bots.filltape.policy.contracts_allow]]
+addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+selectors = ["0xa9059cbb"]     # USDC transfer
