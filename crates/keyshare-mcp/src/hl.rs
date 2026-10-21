@@ -52,6 +52,18 @@ pub struct AgentFile {
     pub valid_until_ms: u64,
 }
 
+/// Phase 0 signs for testnet only, so refuse any other API host up front. Loopback is allowed
+/// for local mocks.
+pub fn check_api_url(config: Option<&HlConfig>) -> Result<(), String> {
+    let Some(url) = config.and_then(|c| c.api_url.as_deref()) else { return Ok(()) };
+    let host = url.split("://").nth(1).unwrap_or("").split(['/', ':']).next().unwrap_or("");
+    if matches!(host, "api.hyperliquid-testnet.xyz" | "127.0.0.1" | "localhost") {
+        Ok(())
+    } else {
+        Err(format!("hyperliquid api_url {url:?} is not testnet; Phase 0 is testnet only"))
+    }
+}
+
 pub fn agent_path(state_dir: &Path, bot: &str) -> PathBuf {
     state_dir.join("hyperliquid").join(format!("{bot}.agent.json"))
 }
@@ -226,6 +238,38 @@ impl Hyperliquid {
         Ok((value, szi))
     }
 
+    /// The coin's mark price (oracle price if no mark), `E8`. Orders are valued at least at this.
+    async fn mark(&self, coin: &str) -> Result<i128, Refusal> {
+        let v = self.info(json!({"type": "metaAndAssetCtxs"})).await?;
+        let universe = v[0]["universe"].as_array().ok_or_else(|| venue("no universe in metaAndAssetCtxs"))?;
+        let i = universe.iter().position(|a| a["name"] == coin).ok_or_else(|| venue(format!("no {coin} context")))?;
+        let ctx = &v[1][i];
+        let px =
+            ctx["markPx"].as_str().or(ctx["oraclePx"].as_str()).ok_or_else(|| venue(format!("no {coin} price")))?;
+        hl::parse_e8(px).map_err(venue)
+    }
+
+    /// The account's current leverage on this coin.
+    async fn leverage(&self, master: Address, coin: &str) -> Result<u32, Refusal> {
+        let v = self.info(json!({"type": "activeAssetData", "user": master, "coin": coin})).await?;
+        v["leverage"]["value"]
+            .as_u64()
+            .and_then(|l| u32::try_from(l).ok())
+            .ok_or_else(|| venue(format!("no {coin} leverage")))
+    }
+
+    /// Total size of resting orders on this coin and side, `E8`. Counted as if they all fill.
+    async fn resting(&self, master: Address, coin: &str, is_buy: bool) -> Result<i128, Refusal> {
+        let v = self.info(json!({"type": "openOrders", "user": master})).await?;
+        let side = if is_buy { "B" } else { "A" };
+        let mut total: i128 = 0;
+        for o in v.as_array().into_iter().flatten().filter(|o| o["coin"] == coin && o["side"] == side) {
+            let sz = hl::parse_e8(o["sz"].as_str().unwrap_or("0")).map_err(venue)?;
+            total = total.checked_add(sz).ok_or_else(|| venue("open order sizes overflow"))?;
+        }
+        Ok(total)
+    }
+
     /// Loss since the first check of the UTC day, `E8`. Records today's starting value if new.
     fn loss_today(&self, bot: &str, value: i128) -> Result<i128, Refusal> {
         let day = now_ms() / 86_400_000;
@@ -265,18 +309,26 @@ impl Hyperliquid {
         if hl::decimals(&s) > asset.sz_decimals {
             return Err(bad_args(format!("{} sizes have at most {} decimals", o.coin, asset.sz_decimals)));
         }
-        let (position_after, loss) = if o.reduce_only {
-            (0, 0)
+        // Reading the account also sets the day's loss baseline, reduce-only orders included.
+        let (value, szi) = self.account(master, &o.coin).await?;
+        let loss = self.loss_today(bot, value)?;
+        let (value_px, position_after, leverage) = if o.reduce_only {
+            (px, 0, 0)
         } else {
-            let (value, szi) = self.account(master, &o.coin).await?;
-            (if o.is_buy { szi + sz } else { szi - sz }, self.loss_today(bot, value)?)
+            let mark = self.mark(&o.coin).await?;
+            let resting = self.resting(master, &o.coin, o.is_buy).await?;
+            let overflow = || bad_args("size overflows");
+            let added = sz.checked_add(resting).ok_or_else(overflow)?;
+            let after = if o.is_buy { szi.checked_add(added) } else { szi.checked_sub(added) }.ok_or_else(overflow)?;
+            (px.max(mark), after, self.leverage(master, &o.coin).await?)
         };
         policy.check_order(&OrderCheck {
             coin: &o.coin,
             reduce_only: o.reduce_only,
             sz_e8: sz,
-            px_e8: px,
+            px_e8: value_px,
             position_after_e8: position_after,
+            leverage,
             loss_today_e8: loss,
         })?;
         let t = match &o.trigger_px {
@@ -418,6 +470,10 @@ impl Hyperliquid {
             let master = exec.with_wallet(move |w| w.address(&b)).await.map_err(bad)??;
             self.policy(bot)?;
             let state = self.info(json!({"type": "clearinghouseState", "user": master})).await?;
+            // A read sets the day's loss baseline too, so overnight losses count from the first look.
+            if let Some(v) = state["marginSummary"]["accountValue"].as_str().and_then(|v| hl::parse_e8(v).ok()) {
+                self.loss_today(bot, v)?;
+            }
             let orders = self.info(json!({"type": "openOrders", "user": master})).await?;
             Ok::<_, Refusal>(json!({ "master": master, "state": state, "open_orders": orders }))
         };
@@ -466,7 +522,7 @@ pub async fn approve_agent(
         "vaultAddress": Value::Null,
         "expiresAfter": Value::Null,
     });
-    let venue = config.hyperliquid();
+    let venue = config.hyperliquid().map_err(|e| e.to_string())?;
     let resp = venue.post("/exchange", &body).await.map_err(|r| r.reason)?;
     if resp["status"] != "ok" {
         return Err(format!("Hyperliquid refused the agent: {resp}"));
@@ -485,7 +541,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    // A stale tmp file could carry looser permissions; start fresh so mode 0600 applies.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)

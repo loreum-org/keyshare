@@ -60,7 +60,8 @@ pub fn decimals(wire: &str) -> u32 {
 
 /// `|size × price|` in micro-USD, rounded up. Inputs are `E8` fixed point.
 pub fn notional_usd(sz_e8: i128, px_e8: i128) -> UsdMicros {
-    let p = sz_e8.unsigned_abs() * px_e8.unsigned_abs();
+    // Saturates rather than wraps: an absurd size reads as an absurd notional and is refused.
+    let p = sz_e8.unsigned_abs().saturating_mul(px_e8.unsigned_abs());
     p.div_ceil(10_000_000_000)
 }
 
@@ -298,9 +299,13 @@ pub struct OrderCheck<'a> {
     pub coin: &'a str,
     pub reduce_only: bool,
     pub sz_e8: i128,
+    /// Price the order is valued at: the larger of its limit and the coin's mark, so a sell
+    /// with a token limit can't hide its size. `E8`.
     pub px_e8: i128,
-    /// Signed position size after the order fills, `E8`.
+    /// Signed position size if this order and every same-side resting order fill, `E8`.
     pub position_after_e8: i128,
+    /// The account's current leverage on this coin; orders use it, not a per-order value.
+    pub leverage: u32,
     /// Account value at the start of the UTC day minus now, `E8`. Negative is a gain.
     pub loss_today_e8: i128,
 }
@@ -326,6 +331,15 @@ impl HlPolicy {
         self.check_market(o.coin)?;
         if o.reduce_only {
             return Ok(());
+        }
+        if o.leverage > self.max_leverage {
+            return Err(Refusal::new(
+                RefusalCode::LeverageTooHigh,
+                format!(
+                    "{} is at {}x, over this bot's {}x; call hl_set_leverage first",
+                    o.coin, o.leverage, self.max_leverage
+                ),
+            ));
         }
         let order = notional_usd(o.sz_e8, o.px_e8);
         if order > usd_micros(self.max_order_usd) {
@@ -543,6 +557,7 @@ mod tests {
                 sz_e8: parse_e8(sz).unwrap(),
                 px_e8: parse_e8(px).unwrap(),
                 position_after_e8: parse_e8(after).unwrap(),
+                leverage: 3,
                 loss_today_e8: parse_e8(loss).unwrap(),
             })
             .map_err(|r| r.code)
@@ -559,6 +574,19 @@ mod tests {
         assert_eq!(check("ETH", "0.4", "2500", "0.4", "-500", false), Ok(()));
         // Reduce-only gets through even at the stop and over the caps.
         assert_eq!(check("ETH", "5", "2500", "0", "1000", true), Ok(()));
+        let mut high = OrderCheck {
+            coin: "ETH",
+            reduce_only: false,
+            sz_e8: E8,
+            px_e8: E8,
+            position_after_e8: E8,
+            leverage: 20,
+            loss_today_e8: 0,
+        };
+        assert_eq!(policy().check_order(&high).map_err(|r| r.code), Err(RefusalCode::LeverageTooHigh));
+        high.reduce_only = true;
+        assert_eq!(policy().check_order(&high).map_err(|r| r.code), Ok(()));
+        assert_eq!(notional_usd(i128::MAX, i128::MAX), u128::MAX.div_ceil(10_000_000_000));
         assert_eq!(policy().check_leverage("ETH", 5).map_err(|r| r.code), Ok(()));
         assert_eq!(policy().check_leverage("ETH", 6).map_err(|r| r.code), Err(RefusalCode::LeverageTooHigh));
         assert_eq!(policy().check_leverage("ETH", 0).map_err(|r| r.code), Err(RefusalCode::LeverageTooHigh));

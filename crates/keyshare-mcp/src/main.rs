@@ -59,7 +59,7 @@ async fn serve(path: PathBuf) -> Result<()> {
     let chains = Arc::new(Chains::new(&config.chains)?);
     let tokens = Arc::new(config.prices.clone());
     let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
-    let hl = config.hyperliquid();
+    let hl = config.hyperliquid()?;
     let exec = Arc::new(Executor::new(Arc::new(Mutex::new(wallet)), chains, tokens, hold).with_hyperliquid(hl));
     let app = keyshare_mcp::app(exec, creds, config.server.admin_token_sha256, &config.server.allowed_hosts);
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
