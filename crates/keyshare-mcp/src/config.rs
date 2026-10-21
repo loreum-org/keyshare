@@ -86,7 +86,17 @@ impl Config {
     /// True when the spend anchor sits inside `state_dir`, where restoring or deleting that one
     /// directory would defeat the rollback check.
     pub fn anchor_in_state_dir(&self) -> bool {
-        self.server.spend_anchor.as_ref().is_none_or(|a| a.starts_with(&self.server.state_dir))
+        // Compare resolved paths so `./state/x` or a symlink into state_dir is still caught. A path
+        // that doesn't exist yet resolves through its parent.
+        fn resolve(p: &Path) -> PathBuf {
+            p.canonicalize()
+                .or_else(|_| match (p.parent(), p.file_name()) {
+                    (Some(dir), Some(name)) => dir.canonicalize().map(|d| d.join(name)),
+                    _ => Err(std::io::ErrorKind::NotFound.into()),
+                })
+                .unwrap_or_else(|_| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+        }
+        self.server.spend_anchor.as_ref().is_none_or(|a| resolve(a).starts_with(resolve(&self.server.state_dir)))
     }
 
     pub fn state_paths(&self) -> StatePaths {

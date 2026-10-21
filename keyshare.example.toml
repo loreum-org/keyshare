@@ -61,7 +61,7 @@ recipients_allow = []
 # EIP-712 payloads this bot may sign, each bound to its domain, e.g.
 #   [[bots.filltape.policy.typed_data_allow]]
 #   primary_type = "Order"
-#   verifying_contract = "0x..."   # and/or name = "..."
+#   verifying_contract = "0x..."   # required; name = "..." alone only works with chainless
 #   chain_id = 11155111            # or chainless = true for domains without a chainId
 # Permits and Hyperliquid user-signed actions are always refused here.
 typed_data_allow = []
