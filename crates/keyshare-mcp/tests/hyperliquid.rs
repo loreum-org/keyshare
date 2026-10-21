@@ -28,6 +28,11 @@ const PLAIN_KEY: &str = "0x8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7
 struct Venue {
     account_value: String,
     eth_szi: String,
+    /// ETH mark price; BTC is fixed at 60,000.
+    eth_mark: String,
+    /// Current ETH and BTC leverage on the account.
+    leverage: u64,
+    open_orders: Vec<Value>,
     posted: Vec<Value>,
 }
 
@@ -48,7 +53,12 @@ async fn mock_hl(venue: Arc<Mutex<Venue>>) -> String {
                         "marginSummary": {"accountValue": v.account_value},
                         "assetPositions": [{"position": {"coin": "ETH", "szi": v.eth_szi}}]
                     }),
-                    "openOrders" => json!([]),
+                    "metaAndAssetCtxs" => json!([
+                        {"universe": [{"name": "BTC"}, {"name": "ETH"}, {"name": "SOL"}]},
+                        [{"markPx": "60000.0"}, {"markPx": v.eth_mark, "oraclePx": "1.0"}, {"oraclePx": "150.0"}]
+                    ]),
+                    "activeAssetData" => json!({"leverage": {"type": "cross", "value": v.leverage}}),
+                    "openOrders" => json!(v.open_orders),
                     t => panic!("mock hl: unexpected info {t}"),
                 })
             }
@@ -81,8 +91,13 @@ fn env(var: &str) -> Option<String> {
 }
 
 async fn fixture() -> Fixture {
-    let venue =
-        Arc::new(Mutex::new(Venue { account_value: "10000.0".into(), eth_szi: "0.0".into(), ..Default::default() }));
+    let venue = Arc::new(Mutex::new(Venue {
+        account_value: "10000.0".into(),
+        eth_szi: "0.0".into(),
+        eth_mark: "2500.0".into(),
+        leverage: 3,
+        ..Default::default()
+    }));
     let api = mock_hl(venue.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(
@@ -126,8 +141,8 @@ async fn fixture() -> Fixture {
     let wallet = Arc::new(Mutex::new(config.wallet(env).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
-    let exec =
-        Executor::new(wallet, chains, Arc::new(vec![]), DEFAULT_HOLD_SECS).with_hyperliquid(config.hyperliquid());
+    let exec = Executor::new(wallet, chains, Arc::new(vec![]), DEFAULT_HOLD_SECS)
+        .with_hyperliquid(config.hyperliquid().unwrap());
     let app = keyshare_mcp::app(Arc::new(exec), creds, None, &[]);
     Fixture { app, config, venue, _dir: dir }
 }
@@ -278,14 +293,42 @@ async fn guardrails_refuse_before_signing() {
     assert_eq!(code(&call(&f.app, "hl_place_order", sell).await), "POSITION_TOO_LARGE");
     let r = call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 10})).await;
     assert_eq!(code(&r), "LEVERAGE_TOO_HIGH");
+
+    // A sell with a token limit is valued at the mark, not the limit: 0.5 ETH is $1,250.
+    f.venue.lock().unwrap().eth_szi = "0.0".into();
+    let lowball = json!({"coin": "ETH", "is_buy": false, "sz": "0.5", "limit_px": "1"});
+    assert_eq!(code(&call(&f.app, "hl_place_order", lowball).await), "ORDER_TOO_LARGE");
+    // Resting same-side orders count toward the position: 0.5 resting + 0.35 new = $2,125.
+    f.venue.lock().unwrap().open_orders = vec![json!({"coin": "ETH", "side": "A", "sz": "0.5", "limitPx": "2600"})];
+    let sell = json!({"coin": "ETH", "is_buy": false, "sz": "0.35", "limit_px": "2500"});
+    assert_eq!(code(&call(&f.app, "hl_place_order", sell.clone()).await), "POSITION_TOO_LARGE");
+    // The account's current leverage binds orders, not only hl_set_leverage.
+    {
+        let mut v = f.venue.lock().unwrap();
+        v.open_orders.clear();
+        v.leverage = 20;
+    }
+    assert_eq!(code(&call(&f.app, "hl_place_order", sell).await), "LEVERAGE_TOO_HIGH");
     assert!(f.venue.lock().unwrap().posted.is_empty());
+}
+
+#[test]
+fn api_url_must_be_testnet() {
+    use keyshare_mcp::hl::{HlConfig, check_api_url};
+    let cfg = |u: &str| HlConfig { api_url: Some(u.into()) };
+    assert!(check_api_url(None).is_ok());
+    assert!(check_api_url(Some(&cfg("https://api.hyperliquid-testnet.xyz"))).is_ok());
+    assert!(check_api_url(Some(&cfg("http://127.0.0.1:9999"))).is_ok());
+    assert!(check_api_url(Some(&cfg("https://api.hyperliquid.xyz"))).is_err());
 }
 
 #[tokio::test]
 async fn daily_loss_stop_allows_only_reduce_only() {
     let f = fixture().await;
     approve(&f).await;
-    // First order of the day records $10,000 as the starting value.
+    // The first look of the day records $10,000 as the starting value.
+    assert_eq!(call(&f.app, "hl_positions", json!({})).await["isError"], false);
+    f.venue.lock().unwrap().account_value = "9950".into();
     assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
     f.venue.lock().unwrap().account_value = "9899.99".into();
     assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "DAILY_LOSS_STOP");

@@ -129,9 +129,10 @@ impl Config {
         Wallet::open(accounts, Box::new(prices), &self.state_paths()).map_err(|e| ConfigError::Other(e.to_string()))
     }
 
-    pub fn hyperliquid(&self) -> Hyperliquid {
+    pub fn hyperliquid(&self) -> Result<Hyperliquid, ConfigError> {
+        crate::hl::check_api_url(self.hyperliquid.as_ref()).map_err(ConfigError::Other)?;
         let policies =
             self.bots.iter().filter_map(|(bot, cfg)| Some((bot.clone(), cfg.hyperliquid.clone()?))).collect();
-        Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies)
+        Ok(Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies))
     }
 }
