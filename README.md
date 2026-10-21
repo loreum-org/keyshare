@@ -1,6 +1,6 @@
 # keyshare
 
-A threshold-signing wallet for humans and agents. The signing key is a plain EOA from a 2-of-3 distributed key generation, so the full private key never exists. Policy is enforced off-chain by the signer nodes and, in the target design, ZK proofs. There is no Safe or smart-account layer.
+A threshold-signing wallet for humans and agents. The signing key is a plain EOA from a 2-of-3 distributed key generation, so the full private key never exists. Each signer node enforces policy in plain Rust. ZK proofs are a later option, not part of v1. There is no Safe or smart-account layer.
 
 **Status:** Phase 0 (testnet MVP) in progress. Design draft v0.1 (Oct 18, 2026).
 
@@ -32,7 +32,7 @@ Every user is the admin of their own wallets. Admin keys authorize policy, grant
 
 ## Trust model
 
-Trust rests on fewer than *t* of *n* independent operators being compromised (2-of-3), plus the soundness of the policy circuit, rather than on a chip vendor's attestation. The coordinator holds no key share. There is no on-chain spending limit or time-lock: if the threshold is compromised or a policy bug lets a bad transaction through, the chain will accept it. Mitigations are small balances, separate wallets per bot, independent operators, resharing, and a kill switch.
+Trust rests on fewer than *t* of *n* independent operators being compromised (2-of-3). One bad node cannot sign. Policy is plain Rust on each signer, not a proof. The coordinator holds no key share. There is no on-chain spending limit or time-lock: if the threshold is compromised or a policy bug lets a bad transaction through, the chain will accept it. Mitigations are small balances, separate wallets per bot, independent operators, resharing, and a kill switch.
 
 ## Architecture
 
@@ -48,16 +48,15 @@ flowchart LR
   subgraph MCP["Wallet MCP connector (Railway)"]
     API[Tool API + caller auth<br/>human session / bot credential]
     SIM[Simulator<br/>eth_call / trace / Tenderly-style]
-    POL[Policy pre-check]
-    PRV[ZK prover]
+    POL[Policy pre-check<br/>fails fast, not enforcement]
     COORD[Signing coordinator<br/>holds NO key share]
     LOG[(Append-only audit log)]
   end
 
   subgraph Shares["Key shares (2-of-3 per wallet)"]
     DEV[Device share<br/>Secure Enclave / Keystore<br/>human wallets]
-    N1[Node A<br/>share + verifier + counters]
-    N2[Node B<br/>share + verifier + counters]
+    N1[Node A<br/>share + plain-Rust policy + counters]
+    N2[Node B<br/>share + plain-Rust policy + counters]
     BOTS[Bot-held share<br/>optional, agent wallets]
     COLD[Owner offline backup share<br/>agent wallets, offline]
   end
@@ -73,8 +72,8 @@ flowchart LR
   HU -->|request + on-device approval| API
   LB & FB & TB -->|MCP call + bot credential| API
   API --> SIM --> RPC
-  API --> POL --> PRV
-  PRV -->|tx, proof, public inputs| COORD
+  API --> POL --> COORD
+  COORD -->|raw tx| N1 & N2
   COORD <-->|TSS rounds DKLs23 / CGGMP| N1 & N2
   COORD <-->|TSS rounds after user approval| DEV
   COORD <-.->|agent wallets that hold a share| BOTS
@@ -95,11 +94,11 @@ flowchart LR
 
 | Phase | Scope |
 |---|---|
-| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-code policy, audit log, kill switch. **In progress.** |
+| **0 — Testnet MVP** | MCP connector, local single-key signer, simulation, plain-Rust policy, audit log, kill switch. No ZK proofs. **In progress.** |
 | **1 — Interim production** (optional) | Same API, vendor policy-enforced keys (Turnkey, or Privy/CDP). Small mainnet balances. |
-| **2a — Own TSS network** | DKLs23 2-of-3, plain-code policy at every node, human wallet app, owner admin model. |
-| **2b — ZK policy proofs** | Nodes verify proofs against committed policy and spend roots. |
-| **3 — Chamber offering** (optional) | Signer network and policy circuits for DAO and agent treasuries. |
+| **2 — Own TSS network** | DKLs23 2-of-3. Each node enforces policy in plain Rust. Human wallet app, owner admin model. |
+| **3 — Chamber offering** (optional) | Signer network and plain-Rust policy for DAO and agent treasuries. |
 | **4 — Multiple addresses** (later) | Labeled addresses from one threshold key via non-hardened derivation. |
+| **5 — ZK policy proofs** (later, optional) | Only if a third party must verify that policy was followed, or policy must be hidden from node operators. Noir, with SP1 as the alternative. |
 
 Details, threat model, the MCP tool API, operations, and recovery are in [docs/design.md](docs/design.md).
