@@ -13,7 +13,7 @@ pub mod signer;
 pub mod spend;
 pub mod wallet;
 
-pub use policy::{Action, Limits, PlainPolicy, PolicyEngine, Verdict};
+pub use policy::{Action, Limits, PlainPolicy, PolicyEngine, TypedDataRule, Verdict};
 pub use price::{PriceSource, PriceTable, UsdMicros};
 pub use refusal::{Refusal, RefusalCode};
 pub use signer::{LocalSigner, Signer};

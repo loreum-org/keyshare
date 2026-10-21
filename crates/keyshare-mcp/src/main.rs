@@ -52,6 +52,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 async fn serve(path: PathBuf) -> Result<()> {
     let config = Config::load(&path)?;
     let creds = Arc::new(config.credentials()?);
+    if config.anchor_in_state_dir() {
+        eprintln!(
+            "warning: spend_anchor is inside state_dir; put it on another disk so a restored or deleted state dir is caught"
+        );
+    }
     let wallet = config.wallet(|var| std::env::var(var).ok())?;
     for bot in config.bots.keys() {
         eprintln!("bot {bot}: {}", wallet.address(bot)?);

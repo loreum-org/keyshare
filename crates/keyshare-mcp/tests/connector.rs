@@ -116,7 +116,6 @@ async fn fixture() -> Fixture {
         per_tx_cap_usd = 200
         daily_cap_usd = 500
         recipients_allow = ["{OWNER}"]
-        typed_data_allow = ["Order"]
 
         [[bots.filltape.policy.contracts_allow]]
         addr = "{USDC}"
@@ -289,6 +288,13 @@ async fn refusals_carry_a_code() {
         "primaryType": "Permit", "domain": {}, "message": {"value": "1"}
     });
     let out = call(&f.app, s.as_deref(), "sign_typed_data", json!({"typed_data": permit})).await;
+    assert_eq!(out["structuredContent"]["code"], "DENIED_PRIMITIVE");
+
+    let order = json!({
+        "types": {"EIP712Domain": [{"name": "name", "type": "string"}], "Order": [{"name": "size", "type": "uint256"}]},
+        "primaryType": "Order", "domain": {"name": "SomeDex"}, "message": {"size": "1"}
+    });
+    let out = call(&f.app, s.as_deref(), "sign_typed_data", json!({"typed_data": order})).await;
     assert_eq!(out["structuredContent"]["code"], "TYPED_DATA_NOT_ALLOWED");
 }
 
