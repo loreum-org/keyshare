@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::{Address, B256};
 use keyshare_core::hyperliquid::HlPolicy;
 use keyshare_core::price::PriceEntry;
-use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
+use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
@@ -112,11 +112,12 @@ impl Config {
                 .ok_or_else(|| ConfigError::MissingKey { bot: bot.clone(), var: cfg.key_env.clone() })?;
             let signer = LocalSigner::from_hex(&key)
                 .map_err(|e| ConfigError::BadKey { bot: bot.clone(), why: e.to_string() })?;
+            let own = signer.address();
             accounts.insert(
                 bot.clone(),
                 Account {
                     signer: Box::new(signer),
-                    policy: Box::new(cfg.policy.clone()),
+                    policy: Box::new(PlainPolicy { own_address: Some(own), ..cfg.policy.clone() }),
                     admins: cfg.admin_keys.clone(),
                 },
             );

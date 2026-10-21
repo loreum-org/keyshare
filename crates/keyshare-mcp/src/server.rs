@@ -23,6 +23,7 @@ use crate::auth::Caller;
 use crate::chain;
 use crate::exec::{Executor, Outcome, RequestState, now, scoped, usd};
 use crate::hl::{Hyperliquid, OrderSpec};
+use crate::swap::{self, SwapRequest};
 
 sol! { function transfer(address to, uint256 amount); }
 
@@ -64,6 +65,27 @@ pub struct CallArgs {
     pub data: Bytes,
     /// Native value in wei, as a decimal string. Default 0.
     pub value_wei: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SwapArgs {
+    pub chain_id: u64,
+    /// ERC-20 to sell. Omit to sell the chain's native token.
+    #[schemars(with = "Option<String>")]
+    pub sell_token: Option<Address>,
+    /// ERC-20 to buy (use the wrapped token for native).
+    #[schemars(with = "String")]
+    pub buy_token: Address,
+    /// Decimal amount to sell, in whole tokens.
+    pub amount: String,
+    /// Default and maximum: this bot's policy limit.
+    pub max_slippage_bps: Option<u32>,
+    /// Only "uniswap_v3" for now.
+    pub route_provider: Option<String>,
+    /// Quote and check only. Nothing is signed.
     #[serde(default)]
     pub dry_run: bool,
     pub request_id: Option<String>,
@@ -373,6 +395,28 @@ impl KeyshareServer {
             ..Default::default()
         };
         self.submit(caller, args.request_id, tx, args.dry_run).await
+    }
+
+    #[tool(
+        description = "Swap an exact amount on Uniswap v3. Quotes first; the output always comes back to this wallet with at most max_slippage_bps below the quote. Approves the router for exactly the amount if needed."
+    )]
+    async fn swap(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<SwapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let id = new_request_id(args.request_id);
+        let req = SwapRequest {
+            chain_id: args.chain_id,
+            sell_token: args.sell_token,
+            buy_token: args.buy_token,
+            amount: args.amount,
+            max_slippage_bps: args.max_slippage_bps,
+            route_provider: args.route_provider,
+            dry_run: args.dry_run,
+        };
+        swap::swap(&self.exec, &caller, &id, req).await.map(to_result).map_err(internal)
     }
 
     #[tool(

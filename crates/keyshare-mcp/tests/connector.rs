@@ -253,6 +253,7 @@ async fn lists_tools() {
             "sign_message",
             "sign_typed_data",
             "simulate",
+            "swap",
             "tx_status"
         ]
     );

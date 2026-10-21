@@ -22,10 +22,21 @@ state_dir = "./state"
 [[chains]]
 id = 11155111                  # Sepolia
 rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# Uniswap v3 on Sepolia, for the swap tool. Add the router to a bot's contracts_allow to let it swap.
+[chains.uniswap_v3]
+router = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"   # SwapRouter02
+quoter = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"   # QuoterV2
+weth = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
 
 # Fixed USD prices for caps (Phase 0). Tokens with no price are refused.
 [[prices]]
 chain_id = 11155111            # Sepolia ETH
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia WETH (swaps can only buy priced tokens)
+token = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
 decimals = 18
 usd = "2500"
 
@@ -48,11 +59,19 @@ per_tx_cap_usd = 200
 daily_cap_usd = 500
 recipients_allow = []
 typed_data_allow = []
+max_slippage_bps = 100         # swaps accept at most 1% below the quote
+max_price_deviation_bps = 500  # swap minimum output must be within 5% of the input at the prices above
 # require_admin_cosign_above_usd = 100   # owner approves anything above this, even inside the caps
 
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
-selectors = ["0xa9059cbb"]     # USDC transfer
+selectors = ["0xa9059cbb", "0x095ea7b3"]   # USDC transfer, approve (exact amounts only)
+
+[[bots.filltape.policy.contracts_allow]]
+addr = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+selectors = ["0x04e45aaf"]     # Uniswap SwapRouter02 exactInputSingle
+# Only exactInputSingle is checked against prices. Don't allowlist the router's other
+# selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
 
 # Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
 # agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
