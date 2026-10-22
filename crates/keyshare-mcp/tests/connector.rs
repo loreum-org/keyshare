@@ -455,6 +455,39 @@ async fn owner_approves_a_held_send() {
 }
 
 #[tokio::test]
+async fn simultaneous_approvals_send_once_and_keep_the_tx_hash() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let (id, pending) = hold_one(&f, s.as_deref()).await;
+    let sig = admin().sign_message(pending["approve_message"].as_str().unwrap().as_bytes()).unwrap();
+    let body = json!({"bot": "trader", "request_id": id, "decision": "approve", "signature": sig});
+    let (a, b) = tokio::join!(
+        admin_http(&f.app, "POST", "/admin/decide", None, Some(body.clone())),
+        admin_http(&f.app, "POST", "/admin/decide", None, Some(body)),
+    );
+    let oks = [&a, &b].iter().filter(|(status, _)| *status == StatusCode::OK).count();
+    assert_eq!(oks, 1, "{a:?} {b:?}");
+    assert_eq!(f.sent.lock().unwrap().len(), 1);
+    let st =
+        call_as(&f.app, TRADER_TOKEN, s.as_deref(), "tx_status", json!({"chain_id": 11155111, "request_id": id})).await;
+    assert_eq!(st["structuredContent"]["state"], "confirmed", "{st}");
+}
+
+#[tokio::test]
+async fn one_bot_cannot_pile_up_held_requests() {
+    let f = fixture().await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let send =
+        |i: usize| json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": format!("pile-{i}")});
+    for i in 0..16 {
+        let out = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", send(i)).await;
+        assert_eq!(out["structuredContent"]["state"], "pending_user_approval", "{out}");
+    }
+    let out = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", send(16)).await;
+    assert_eq!(code(&out), "TOO_MANY_PENDING");
+}
+
+#[tokio::test]
 async fn owner_denies_a_held_send() {
     let f = fixture().await;
     let s = session_as(&f.app, TRADER_TOKEN).await;

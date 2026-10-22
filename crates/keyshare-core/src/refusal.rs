@@ -20,6 +20,7 @@ pub enum RefusalCode {
     AdminApprovalRequired,
     BadApproval,
     UserDenied,
+    TooManyPending,
     Expired,
     CounterBehindAnchor,
     SimRevert,

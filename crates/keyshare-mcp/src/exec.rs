@@ -44,9 +44,19 @@ fn refusal(id: &str, r: &Refusal) -> Value {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RequestState {
-    PendingUserApproval { reason: Refusal, expires_at: u64 },
-    Broadcast { tx_hash: B256, approved_by_owner: bool },
-    Refused { refusal: Refusal },
+    PendingUserApproval {
+        reason: Refusal,
+        expires_at: u64,
+    },
+    /// The owner approved and the request is being signed and sent.
+    Executing,
+    Broadcast {
+        tx_hash: B256,
+        approved_by_owner: bool,
+    },
+    Refused {
+        refusal: Refusal,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +79,9 @@ pub struct Executor {
     requests: Mutex<HashMap<String, Request>>,
     hold_secs: u64,
 }
+
+/// Held requests one bot may have waiting for the owner at once.
+const MAX_PENDING_PER_BOT: usize = 16;
 
 /// Request ids are namespaced per caller so one bot can't burn another's ids.
 pub fn scoped(caller: &str, id: &str) -> String {
@@ -100,10 +113,26 @@ impl Executor {
         .map_err(|e| e.to_string())?
     }
 
+    /// A broadcast request keeps its tx hash: nothing later overwrites it, so `tx_status` never
+    /// tells a bot that a transaction on chain was refused.
     fn set_state(&self, key: &str, req: Request) {
-        if let Ok(mut map) = self.requests.lock() {
+        if let Ok(mut map) = self.requests.lock()
+            && !matches!(map.get(key).map(|r| &r.state), Some(RequestState::Broadcast { .. }))
+        {
             map.insert(key.to_string(), req);
         }
+    }
+
+    /// Moves a held request to `Executing`, or returns `None` if another decision got there first.
+    fn claim(&self, key: &str) -> Result<Option<Request>, String> {
+        let mut map = self.requests.lock().map_err(|e| e.to_string())?;
+        let Some(req) = map.get_mut(key) else { return Ok(None) };
+        if !matches!(req.state, RequestState::PendingUserApproval { .. }) {
+            return Ok(None);
+        }
+        let held = req.clone();
+        req.state = RequestState::Executing;
+        Ok(Some(held))
     }
 
     pub fn request_state(&self, caller: &str, id: &str) -> Option<RequestState> {
@@ -143,8 +172,27 @@ impl Executor {
     }
 
     async fn hold(&self, caller: &str, id: &str, tx: TxEip1559, reason: Refusal) -> Result<Outcome, String> {
-        let expires_at = now() + self.hold_secs;
+        let t = now();
+        let expires_at = t + self.hold_secs;
         let key = scoped(caller, id);
+        {
+            // Expired holds can never sign, so drop them; then cap what one bot can keep waiting.
+            let mut map = self.requests.lock().map_err(|e| e.to_string())?;
+            map.retain(
+                |_, r| !matches!(r.state, RequestState::PendingUserApproval { expires_at, .. } if expires_at <= t),
+            );
+            let waiting = map
+                .values()
+                .filter(|r| r.caller == caller && matches!(r.state, RequestState::PendingUserApproval { .. }))
+                .count();
+            if waiting >= MAX_PENDING_PER_BOT {
+                let r = Refusal::new(
+                    RefusalCode::TooManyPending,
+                    format!("{waiting} requests already wait for the owner; {reason}"),
+                );
+                return Ok(Err(refusal(id, &r)));
+            }
+        }
         let (c, k, d) = (caller.to_string(), key.clone(), json!({ "tx": tx_detail(&tx), "reason": reason }));
         self.with_wallet(move |w| {
             w.log_event(&c, &k, AuditEvent::Requested, d.clone(), now());
@@ -299,6 +347,11 @@ impl Executor {
             Ok(a) => a,
             Err(r) => return Ok(Err(refusal(id, &r))),
         };
+        // Two decisions posted at once both pass the check above; only one may act.
+        let Some(held) = self.claim(&key)? else {
+            let r = Refusal::new(RefusalCode::BadApproval, format!("request {id} was already decided"));
+            return Ok(Err(refusal(id, &r)));
+        };
         match decision {
             Decision::Deny => {
                 let r = Refusal::new(RefusalCode::UserDenied, format!("denied by owner key {admin}"));
@@ -308,7 +361,16 @@ impl Executor {
                 Ok(Err(refusal(id, &r)))
             }
             Decision::Approve => {
-                let mut out = self.execute(bot, id, held.tx, Some(signature), false).await?;
+                let out = self.execute(bot, id, held.tx.clone(), Some(signature), false).await;
+                // If it stopped before signing (e.g. an RPC failure), the request waits again so the
+                // owner can retry.
+                if let Ok(mut map) = self.requests.lock()
+                    && let Some(r) = map.get_mut(&key)
+                    && matches!(r.state, RequestState::Executing)
+                {
+                    r.state = held.state;
+                }
+                let mut out = out?;
                 if let Ok(v) = &mut out {
                     v["approved_by"] = json!(admin);
                 }
