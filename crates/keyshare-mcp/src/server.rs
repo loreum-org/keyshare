@@ -331,7 +331,7 @@ impl KeyshareServer {
     }
 
     #[tool(
-        description = "Status of a request or transaction: pending_user_approval, refused, pending, confirmed, failed or unknown."
+        description = "Status of a request or transaction: pending_user_approval, executing (owner approved, being sent), refused, pending, confirmed, failed or unknown."
     )]
     async fn tx_status(
         &self,
