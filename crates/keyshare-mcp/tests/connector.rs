@@ -83,6 +83,10 @@ async fn mock_rpc(sent: Arc<Mutex<Vec<Bytes>>>) -> String {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(DEFAULT_HOLD_SECS).await
+}
+
+async fn fixture_with(hold_secs: u64) -> Fixture {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let rpc_url = mock_rpc(sent.clone()).await;
     let dir = tempfile::tempdir().unwrap();
@@ -150,7 +154,7 @@ async fn fixture() -> Fixture {
     let creds: Credentials = Arc::new(config.credentials().unwrap());
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
     let tokens = Arc::new(config.prices.clone());
-    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, DEFAULT_HOLD_SECS));
+    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, hold_secs));
     let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &[]);
     Fixture { app, wallet, sent, _dir: dir }
 }
@@ -452,6 +456,19 @@ async fn owner_approves_a_held_send() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(out["code"], "BAD_APPROVAL");
     assert_eq!(f.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn expired_hold_frees_the_request_id() {
+    let f = fixture_with(0).await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let args = json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": "held-expire"});
+    let first = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args.clone()).await;
+    assert_eq!(first["structuredContent"]["state"], "pending_user_approval", "{first}");
+    // hold_secs is 0, so the hold is due immediately and must not burn the id.
+    let second = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args).await;
+    assert_eq!(second["structuredContent"]["state"], "pending_user_approval", "{second}");
+    assert_ne!(code(&second), "NONCE_REUSED");
 }
 
 #[tokio::test]

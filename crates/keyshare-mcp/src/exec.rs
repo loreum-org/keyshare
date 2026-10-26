@@ -145,9 +145,19 @@ impl Executor {
         if let Err(r) = self.chains.get(tx.chain_id) {
             return Ok(Err(refusal(id, &r)));
         }
-        if !dry_run && self.requests.lock().map_err(|e| e.to_string())?.contains_key(&key) {
-            let r = Refusal::new(RefusalCode::NonceReused, format!("request {id} was already used"));
-            return Ok(Err(refusal(id, &r)));
+        if !dry_run {
+            // An expired hold can never be signed. Drop it so the same request id can be retried
+            // instead of staying burned until some other hold happens to sweep the map.
+            let mut map = self.requests.lock().map_err(|e| e.to_string())?;
+            let expired = map.get(&key).is_some_and(
+                |r| matches!(r.state, RequestState::PendingUserApproval { expires_at, .. } if expires_at <= now()),
+            );
+            if expired {
+                map.remove(&key);
+            } else if map.contains_key(&key) {
+                let r = Refusal::new(RefusalCode::NonceReused, format!("request {id} was already used"));
+                return Ok(Err(refusal(id, &r)));
+            }
         }
 
         // Policy first: a bad recipient fails fast with a readable reason, before any RPC.
