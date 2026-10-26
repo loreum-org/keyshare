@@ -53,15 +53,29 @@ pub struct AgentFile {
 }
 
 /// Phase 0 signs for testnet only, so refuse any other API host up front. Loopback is allowed
-/// for local mocks.
+/// for local mocks. The host is the authority after the scheme, not the text before the first
+/// colon: `http://127.0.0.1:x@api.hyperliquid.xyz` is userinfo plus the mainnet host.
 pub fn check_api_url(config: Option<&HlConfig>) -> Result<(), String> {
-    let Some(url) = config.and_then(|c| c.api_url.as_deref()) else { return Ok(()) };
-    let host = url.split("://").nth(1).unwrap_or("").split(['/', ':']).next().unwrap_or("");
-    if matches!(host, "api.hyperliquid-testnet.xyz" | "127.0.0.1" | "localhost") {
-        Ok(())
+    let Some(raw) = config.and_then(|c| c.api_url.as_deref()) else { return Ok(()) };
+    let bad = || format!("hyperliquid api_url {raw:?} is not testnet; Phase 0 is testnet only");
+    let (https, rest) = if let Some(rest) = raw.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        (false, rest)
     } else {
-        Err(format!("hyperliquid api_url {url:?} is not testnet; Phase 0 is testnet only"))
+        return Err(bad());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return Err(bad());
     }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost");
+    if host == "api.hyperliquid-testnet.xyz" && https || loopback { Ok(()) } else { Err(bad()) }
 }
 
 pub fn agent_path(state_dir: &Path, bot: &str) -> PathBuf {

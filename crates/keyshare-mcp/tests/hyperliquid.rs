@@ -318,8 +318,13 @@ fn api_url_must_be_testnet() {
     let cfg = |u: &str| HlConfig { api_url: Some(u.into()) };
     assert!(check_api_url(None).is_ok());
     assert!(check_api_url(Some(&cfg("https://api.hyperliquid-testnet.xyz"))).is_ok());
+    assert!(check_api_url(Some(&cfg("https://api.hyperliquid-testnet.xyz/info"))).is_ok());
     assert!(check_api_url(Some(&cfg("http://127.0.0.1:9999"))).is_ok());
     assert!(check_api_url(Some(&cfg("https://api.hyperliquid.xyz"))).is_err());
+    // Userinfo must not disguise the mainnet host as loopback or testnet.
+    assert!(check_api_url(Some(&cfg("https://127.0.0.1:x@api.hyperliquid.xyz"))).is_err());
+    assert!(check_api_url(Some(&cfg("https://api.hyperliquid-testnet.xyz:443@api.hyperliquid.xyz"))).is_err());
+    assert!(check_api_url(Some(&cfg("http://api.hyperliquid-testnet.xyz"))).is_err());
 }
 
 #[tokio::test]

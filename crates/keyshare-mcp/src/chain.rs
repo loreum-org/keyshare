@@ -198,7 +198,7 @@ mod tests {
             rpc_url: "http://127.0.0.1:9/v2/SECRET_API_KEY".into(),
             uniswap_v3: None,
         }])
-            .expect("chains");
+        .expect("chains");
         let p = chains.get(1).expect("provider");
         let refusals = [
             balance(p, Address::ZERO, None).await.unwrap_err(),

@@ -18,7 +18,7 @@ use alloy::sol_types::SolCall;
 use keyshare_core::{Action, Refusal, RefusalCode};
 use serde_json::{Value, json};
 
-use crate::chain::{self, UniswapV3, rpc_err};
+use crate::chain::{self, UniswapV3, rpc_bad, rpc_err};
 use crate::exec::{Executor, Outcome};
 
 sol! {
@@ -104,7 +104,7 @@ async fn best_quote(p: &RootProvider, u: &UniswapV3, sell: Address, buy: Address
 async fn allowance_of(p: &RootProvider, token: Address, owner: Address, spender: Address) -> Result<U256, Refusal> {
     let req = TransactionRequest::default().with_to(token).with_input(allowanceCall { owner, spender }.abi_encode());
     let out = p.call(req).await.map_err(rpc_err)?;
-    allowanceCall::abi_decode_returns(&out).map_err(|e| rpc_err(format!("allowance on {token}: {e}")))
+    allowanceCall::abi_decode_returns(&out).map_err(|e| rpc_bad(format!("allowance on {token}: {e}")))
 }
 
 async fn wait_confirmed(p: &RootProvider, hash: alloy::primitives::B256) -> Result<(), Refusal> {
