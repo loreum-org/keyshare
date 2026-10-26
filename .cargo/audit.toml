@@ -1,0 +1,6 @@
+# crypto-bigint 0.5.5 (RUSTSEC-2026-0387) is pulled in by k256 0.13 via alloy 2.5.
+# The advisory's only patched line is 0.7.6+, and 0.5 has no release. alloy 2.5.0 is
+# the newest alloy and still pins that stack, so this cannot be bumped in-tree.
+# Revisit when alloy moves to k256 0.14 / crypto-bigint 0.7.
+[advisories]
+ignore = ["RUSTSEC-2026-0387"]
