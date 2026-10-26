@@ -86,7 +86,8 @@ impl ContractRule {
     }
 }
 
-/// An allowed recipient: a bare address (any of the policy's chains) or `{ addr, chains }`.
+/// An allowed recipient: a bare address or `{ addr, chains }`. As with contract rules, no chains
+/// (or an empty list) means every chain the policy allows.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum RecipientRule {
@@ -98,7 +99,7 @@ impl RecipientRule {
     fn on(&self, addr: Address, chain_id: u64) -> bool {
         match self {
             Self::Any(a) => *a == addr,
-            Self::On { addr: a, chains } => *a == addr && chains.contains(&chain_id),
+            Self::On { addr: a, chains } => *a == addr && (chains.is_empty() || chains.contains(&chain_id)),
         }
     }
 }
@@ -531,7 +532,7 @@ mod tests {
             chains = [{CHAIN}, {OTHER}]
             per_tx_cap_usd = 200
             daily_cap_usd = 500
-            recipients_allow = ["{ROUTER}", {{ addr = "{FRIEND}", chains = [{CHAIN}] }}]
+            recipients_allow = ["{ROUTER}", {{ addr = "{FRIEND}", chains = [{CHAIN}] }}, {{ addr = "{USDC}", chains = [] }}]
             [[contracts_allow]]
             addr = "{USDC}"
             selectors = ["0xa9059cbb"]
@@ -551,6 +552,8 @@ mod tests {
         assert!(on(CHAIN, tx(FRIEND, eth(1), vec![])).is_ok());
         assert_eq!(code(on(OTHER, tx(FRIEND, eth(1), vec![]))), RefusalCode::RecipientNotAllowed);
         assert!(on(OTHER, tx(ROUTER, eth(1), vec![])).is_ok());
+        // An empty list means every chain, as for contract rules.
+        assert!(on(OTHER, tx(USDC, eth(1), vec![])).is_ok());
         // The same USDC address on another chain may be another contract.
         assert!(on(CHAIN, usdc_transfer(ROUTER, 1)).is_ok());
         assert_eq!(code(on(OTHER, usdc_transfer(ROUTER, 1))), RefusalCode::ContractNotAllowed);
