@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::chainlog::LogError;
 use crate::killswitch::KillSwitch;
-use crate::policy::{Action, PolicyEngine};
+use crate::policy::{Action, PolicyEngine, Verdict};
 use crate::price::{PriceSource, UsdMicros};
 use crate::refusal::{Refusal, RefusalCode};
 use crate::signer::Signer;
@@ -179,13 +179,37 @@ impl Wallet {
     }
 
     /// Every check that can refuse, then the spend record. Nothing here signs.
-    fn authorize(&mut self, caller: &str, request_id: &str, action: Action<'_>, now: u64) -> Result<(), Refusal> {
+    /// The same checks as signing, with nothing recorded, logged or signed. For `dry_run` and
+    /// to fail fast before simulating (design §4 step 3).
+    pub fn preview(&self, caller: &str, action: Action<'_>, now: u64) -> Result<Verdict, Refusal> {
         let account = self.account(caller)?;
         self.kill.check(caller)?;
         self.spend.check_anchor()?;
+        account.policy.check(action, self.spend.spent_24h(caller, now), self.prices.as_ref())
+    }
+
+    /// Logs a refusal that happened outside the signing path (e.g. a simulation revert).
+    pub fn log_refusal(
+        &mut self,
+        caller: &str,
+        request_id: &str,
+        detail: serde_json::Value,
+        refusal: &Refusal,
+        now: u64,
+    ) {
+        for (event, detail) in [(AuditEvent::Requested, detail), (AuditEvent::Refused, json!(refusal))] {
+            let entry = AuditEntry { at: now, request_id: request_id.into(), caller: caller.into(), event, detail };
+            let _ = self.audit.append(&entry);
+        }
+    }
+
+    pub fn prices(&self) -> &dyn PriceSource {
+        self.prices.as_ref()
+    }
+
+    fn authorize(&mut self, caller: &str, request_id: &str, action: Action<'_>, now: u64) -> Result<(), Refusal> {
         self.spend.check_request_id(request_id)?;
-        let spent = self.spend.spent_24h(caller, now);
-        let verdict = account.policy.check(action, spent, self.prices.as_ref())?;
+        let verdict = self.preview(caller, action, now)?;
         // Recorded on approval, before signing (design §6.4). This also burns the request id.
         self.spend
             .record(SpendEntry {

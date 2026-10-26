@@ -10,6 +10,11 @@ state_dir = "./state"
 # Copy of the spend-log head. Put it on another disk so a restored disk image is caught.
 # spend_anchor = "/mnt/anchor/spend.anchor.json"
 
+# RPC per chain. Chain tools refuse chains not listed here.
+[[chains]]
+id = 11155111                  # Sepolia
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+
 # Fixed USD prices for caps (Phase 0). Tokens with no price are refused.
 [[prices]]
 chain_id = 11155111            # Sepolia ETH

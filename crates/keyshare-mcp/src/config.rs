@@ -9,10 +9,15 @@ use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
 use serde::Deserialize;
 
+use crate::chain::ChainConfig;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
+    /// RPC endpoint per chain. Chain tools refuse chains not listed here.
+    #[serde(default)]
+    pub chains: Vec<ChainConfig>,
     #[serde(default)]
     pub prices: Vec<PriceEntry>,
     /// Keyed by bot id.
@@ -23,7 +28,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
-    /// Host header values to accept (DNS-rebinding guard). Defaults to localhost only.
+    /// Host header values to accept (DNS-rebinding guard). Empty leaves the guard off, so bind
+    /// `listen` to localhost unless this lists the hosts you actually serve.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Holds the spend log, audit log and kill switch file.

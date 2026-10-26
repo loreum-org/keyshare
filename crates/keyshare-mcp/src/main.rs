@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use keyshare_core::killswitch::KillSwitch;
 use keyshare_mcp::auth::new_token;
+use keyshare_mcp::chain::Chains;
 use keyshare_mcp::config::Config;
 
 const USAGE: &str = "\
@@ -45,7 +46,9 @@ async fn serve(path: PathBuf) -> Result<()> {
     for bot in config.bots.keys() {
         eprintln!("bot {bot}: {}", wallet.address(bot)?);
     }
-    let app = keyshare_mcp::app(Arc::new(Mutex::new(wallet)), creds, &config.server.allowed_hosts);
+    let chains = Arc::new(Chains::new(&config.chains)?);
+    let tokens = Arc::new(config.prices.clone());
+    let app = keyshare_mcp::app(Arc::new(Mutex::new(wallet)), chains, tokens, creds, &config.server.allowed_hosts);
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     eprintln!("listening on {}", listener.local_addr()?);
     axum::serve(listener, app)
