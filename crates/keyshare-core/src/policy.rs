@@ -640,7 +640,11 @@ mod tests {
     #[test]
     fn huge_swap_input_does_not_wrap_the_price_floor() {
         let mut p = policy();
-        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        p.contracts_allow.push(ContractRule {
+            addr: ROUTER,
+            selectors: vec![exactInputSingleCall::SELECTOR.into()],
+            chains: vec![],
+        });
         p.own_address = Some(FRIEND);
         // USDC is $1 with 6 decimals, so the USD value in micros equals the base amount. This
         // amount still fits in u128, but amount * 9500 does not.
