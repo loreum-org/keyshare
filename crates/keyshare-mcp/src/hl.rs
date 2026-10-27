@@ -5,7 +5,7 @@
 //! Every action goes through the kill switch, this bot's [`HlPolicy`] and the audit log before
 //! the agent key signs it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +144,9 @@ pub struct Hyperliquid {
     policies: HashMap<String, HlPolicy>,
     /// Nonces are millisecond timestamps, unique per agent (design §8).
     last_nonce: Mutex<u64>,
+    /// Caller-scoped request ids that have reached signing. In memory, like EVM request ids: a
+    /// restart forgets them. A second use is refused before the agent signs again.
+    used_requests: Mutex<HashSet<String>>,
     meta: tokio::sync::Mutex<Option<HashMap<String, Asset>>>,
 }
 
@@ -156,8 +159,20 @@ impl Hyperliquid {
             state_dir,
             policies,
             last_nonce: Mutex::new(0),
+            used_requests: Mutex::new(HashSet::new()),
             meta: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// `true` when this caller is the first to use `key`.
+    fn claim_request(&self, key: &str) -> bool {
+        let mut used = self.used_requests.lock().unwrap_or_else(|e| e.into_inner());
+        used.insert(key.to_string())
+    }
+
+    fn release_request(&self, key: &str) {
+        let mut used = self.used_requests.lock().unwrap_or_else(|e| e.into_inner());
+        used.remove(key);
     }
 
     fn policy(&self, bot: &str) -> Result<&HlPolicy, Refusal> {
@@ -371,6 +386,31 @@ impl Hyperliquid {
     /// Audits, signs with the agent key and posts one L1 action.
     async fn send(&self, exec: &Executor, bot: &str, id: &str, action: L1Action) -> Result<Outcome, String> {
         let detail = json!({ "venue": "hyperliquid", "action": action });
+        let key = crate::exec::scoped(bot, id);
+        if !self.claim_request(&key) {
+            let r = Refusal::new(RefusalCode::NonceReused, format!("request {id} was already used"));
+            return self.refuse(exec, bot, id, detail, r).await;
+        }
+        // Recheck immediately before signing. `prepare` already checked, then waited on the venue.
+        let b = bot.to_string();
+        match exec.with_wallet(move |w| w.kill_switch().check(&b)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(r)) => {
+                self.release_request(&key);
+                return self.refuse(exec, bot, id, detail, r).await;
+            }
+            Err(e) => {
+                self.release_request(&key);
+                return Err(e);
+            }
+        }
+        let (b, i, d) = (bot.to_string(), id.to_string(), detail.clone());
+        if let Err(e) =
+            exec.with_wallet(move |w| w.log_event(&b, &i, AuditEvent::Requested, d, crate::exec::now())).await
+        {
+            self.release_request(&key);
+            return Err(e);
+        }
         let signed = (|| {
             let agent = self.agent(bot)?;
             let nonce = self.nonce();
@@ -380,13 +420,15 @@ impl Hyperliquid {
         })();
         let (nonce, signature) = match signed {
             Ok(s) => s,
-            Err(r) => return self.refuse(exec, bot, id, detail, r).await,
+            Err(r) => {
+                self.release_request(&key);
+                return self.refuse(exec, bot, id, detail, r).await;
+            }
         };
-        let (b, i, d) = (bot.to_string(), id.to_string(), detail.clone());
+        // Signed from here, whether or not the post lands. The id stays used.
+        let (b, i) = (bot.to_string(), id.to_string());
         exec.with_wallet(move |w| {
-            let now = crate::exec::now();
-            w.log_event(&b, &i, AuditEvent::Requested, d, now);
-            w.log_event(&b, &i, AuditEvent::Signed, json!({ "nonce": nonce }), now);
+            w.log_event(&b, &i, AuditEvent::Signed, json!({ "nonce": nonce }), crate::exec::now())
         })
         .await?;
         let body = json!({
