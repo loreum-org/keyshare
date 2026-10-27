@@ -92,7 +92,11 @@ impl ContractRule {
 #[serde(untagged)]
 pub enum RecipientRule {
     Any(Address),
-    On { addr: Address, chains: Vec<u64> },
+    On {
+        addr: Address,
+        #[serde(default)]
+        chains: Vec<u64>,
+    },
 }
 
 impl RecipientRule {
@@ -278,7 +282,10 @@ impl PlainPolicy {
             return Err(refuse(RefusalCode::DeniedPrimitive, "setApprovalForAll is always denied"));
         }
         if !approved && !self.contract_allows(tx.chain_id, to, selector) {
-            return Err(refuse(RefusalCode::ContractNotAllowed, format!("call {selector} on {to} is not allowlisted")));
+            return Err(refuse(
+                RefusalCode::ContractNotAllowed,
+                format!("call {selector} on {to} is not allowlisted on chain {}", tx.chain_id),
+            ));
         }
 
         let token_outflow = if selector == transferCall::SELECTOR {
@@ -295,7 +302,7 @@ impl PlainPolicy {
             if !approved && !self.is_allowlisted_contract(tx.chain_id, call.spender) {
                 return Err(refuse(
                     RefusalCode::ContractNotAllowed,
-                    format!("approve spender {} is not an allowlisted contract", call.spender),
+                    format!("approve spender {} is not an allowlisted contract on chain {}", call.spender, tx.chain_id),
                 ));
             }
             // An approval can move that much later, so it counts as outflow now.
@@ -538,7 +545,7 @@ mod tests {
             chains = [{CHAIN}, {OTHER}]
             per_tx_cap_usd = 200
             daily_cap_usd = 500
-            recipients_allow = ["{ROUTER}", {{ addr = "{FRIEND}", chains = [{CHAIN}] }}, {{ addr = "{USDC}", chains = [] }}]
+            recipients_allow = ["{ROUTER}", {{ addr = "{FRIEND}", chains = [{CHAIN}] }}, {{ addr = "{USDC}", chains = [] }}, {{ addr = "{STRANGER}" }}]
             [[contracts_allow]]
             addr = "{USDC}"
             selectors = ["0xa9059cbb"]
@@ -560,6 +567,7 @@ mod tests {
         assert!(on(OTHER, tx(ROUTER, eth(1), vec![])).is_ok());
         // An empty list means every chain, as for contract rules.
         assert!(on(OTHER, tx(USDC, eth(1), vec![])).is_ok());
+        assert!(on(OTHER, tx(STRANGER, eth(1), vec![])).is_ok());
         // The same USDC address on another chain may be another contract.
         assert!(on(CHAIN, usdc_transfer(ROUTER, 1)).is_ok());
         assert_eq!(code(on(OTHER, usdc_transfer(ROUTER, 1))), RefusalCode::ContractNotAllowed);
