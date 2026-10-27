@@ -472,6 +472,27 @@ async fn expired_hold_frees_the_request_id() {
 }
 
 #[tokio::test]
+async fn expired_decision_frees_the_request_id() {
+    let f = fixture_with(0).await;
+    let s = session_as(&f.app, TRADER_TOKEN).await;
+    let args = json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": "held-expire-decide"});
+    let first = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args.clone()).await;
+    assert_eq!(first["structuredContent"]["state"], "pending_user_approval", "{first}");
+    let sig = admin().sign_message(b"too late").unwrap();
+    let body = json!({
+        "bot": "trader",
+        "request_id": "held-expire-decide",
+        "decision": "approve",
+        "signature": sig,
+    });
+    let (status, out) = admin_http(&f.app, "POST", "/admin/decide", None, Some(body)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert_eq!(out["code"], "EXPIRED", "{out}");
+    let second = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args).await;
+    assert_eq!(second["structuredContent"]["state"], "pending_user_approval", "{second}");
+}
+
+#[tokio::test]
 async fn simultaneous_approvals_send_once_and_keep_the_tx_hash() {
     let f = fixture().await;
     let s = session_as(&f.app, TRADER_TOKEN).await;

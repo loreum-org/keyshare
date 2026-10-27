@@ -83,6 +83,20 @@ pub struct Executor {
 /// Held requests one bot may have waiting for the owner at once.
 const MAX_PENDING_PER_BOT: usize = 16;
 
+enum Claim {
+    Ready(Box<Request>),
+    Expired,
+    Unavailable,
+}
+
+fn releases_request_id(state: &RequestState, t: u64) -> bool {
+    match state {
+        RequestState::PendingUserApproval { expires_at, .. } => *expires_at <= t,
+        RequestState::Refused { refusal } => refusal.code == RefusalCode::Expired,
+        RequestState::Executing | RequestState::Broadcast { .. } => false,
+    }
+}
+
 /// Request ids are namespaced per caller so one bot can't burn another's ids.
 pub fn scoped(caller: &str, id: &str) -> String {
     format!("{caller}:{id}")
@@ -123,16 +137,42 @@ impl Executor {
         }
     }
 
-    /// Moves a held request to `Executing`, or returns `None` if another decision got there first.
-    fn claim(&self, key: &str) -> Result<Option<Request>, String> {
+    /// An expired hold, and a refusal that only records that expiry, can never sign. Dropping
+    /// them lets the bot retry the id. Which one is stored depends on whether `decide` or
+    /// `submit` observed the deadline first.
+    fn release_expired(&self, key: &str) -> Result<bool, String> {
         let mut map = self.requests.lock().map_err(|e| e.to_string())?;
-        let Some(req) = map.get_mut(key) else { return Ok(None) };
-        if !matches!(req.state, RequestState::PendingUserApproval { .. }) {
-            return Ok(None);
+        let Some(req) = map.get(key) else { return Ok(false) };
+        if releases_request_id(&req.state, now()) {
+            map.remove(key);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        let held = req.clone();
-        req.state = RequestState::Executing;
-        Ok(Some(held))
+    }
+
+    /// Claims the hold identified by `expires_at`. A newer hold for the same id is left alone, so
+    /// a late decision on an expired hold can't overwrite a retry. Expiry is rechecked under the
+    /// same lock as the claim.
+    fn claim(&self, key: &str, expires_at: u64) -> Result<Claim, String> {
+        let mut map = self.requests.lock().map_err(|e| e.to_string())?;
+        let Some(req) = map.get_mut(key) else { return Ok(Claim::Unavailable) };
+        match &req.state {
+            RequestState::PendingUserApproval { expires_at: exp, .. } if *exp == expires_at && now() < *exp => {
+                let held = Box::new(req.clone());
+                req.state = RequestState::Executing;
+                Ok(Claim::Ready(held))
+            }
+            RequestState::PendingUserApproval { expires_at: exp, .. } if *exp == expires_at => {
+                let r = Refusal::new(RefusalCode::Expired, format!("request {} expired", req.id));
+                req.state = RequestState::Refused { refusal: r };
+                Ok(Claim::Expired)
+            }
+            RequestState::PendingUserApproval { .. }
+            | RequestState::Executing
+            | RequestState::Broadcast { .. }
+            | RequestState::Refused { .. } => Ok(Claim::Unavailable),
+        }
     }
 
     pub fn request_state(&self, caller: &str, id: &str) -> Option<RequestState> {
@@ -148,13 +188,8 @@ impl Executor {
         if !dry_run {
             // An expired hold can never be signed. Drop it so the same request id can be retried
             // instead of staying burned until some other hold happens to sweep the map.
-            let mut map = self.requests.lock().map_err(|e| e.to_string())?;
-            let expired = map.get(&key).is_some_and(
-                |r| matches!(r.state, RequestState::PendingUserApproval { expires_at, .. } if expires_at <= now()),
-            );
-            if expired {
-                map.remove(&key);
-            } else if map.contains_key(&key) {
+            let held = self.requests.lock().map_err(|e| e.to_string())?.contains_key(&key);
+            if held && !self.release_expired(&key)? {
                 let r = Refusal::new(RefusalCode::NonceReused, format!("request {id} was already used"));
                 return Ok(Err(refusal(id, &r)));
             }
@@ -325,6 +360,35 @@ impl Executor {
         out
     }
 
+    /// Records that `expires_at`'s hold expired, unless a newer hold has already replaced it.
+    async fn expire(&self, bot: &str, id: &str, key: &str, expires_at: u64) -> Result<Outcome, String> {
+        let r = Refusal::new(RefusalCode::Expired, format!("request {id} expired"));
+        let log = {
+            let mut map = self.requests.lock().map_err(|e| e.to_string())?;
+            match map.get_mut(key) {
+                Some(req)
+                    if matches!(
+                        &req.state,
+                        RequestState::PendingUserApproval { expires_at: exp, .. } if *exp == expires_at
+                    ) =>
+                {
+                    req.state = RequestState::Refused { refusal: r.clone() };
+                    true
+                }
+                // `claim` already stored the expiry under the lock. Log that one, and nothing else.
+                Some(req) if matches!(&req.state, RequestState::Refused { refusal } if refusal.code == RefusalCode::Expired) => {
+                    true
+                }
+                _ => false,
+            }
+        };
+        if log {
+            let (b, k, r2) = (bot.to_string(), key.to_string(), r.clone());
+            self.with_wallet(move |w| w.log_event(&b, &k, AuditEvent::Refused, json!(r2), now())).await?;
+        }
+        Ok(Err(refusal(id, &r)))
+    }
+
     /// The owner's approve or deny on a held request.
     pub async fn decide(
         &self,
@@ -344,11 +408,7 @@ impl Executor {
             return Ok(Err(refusal(id, &r)));
         };
         if now() >= expires_at {
-            let r = Refusal::new(RefusalCode::Expired, format!("request {id} expired"));
-            let (b, k, r2) = (bot.to_string(), key.clone(), r.clone());
-            self.with_wallet(move |w| w.log_event(&b, &k, AuditEvent::Refused, json!(r2), now())).await?;
-            self.set_state(&key, Request { state: RequestState::Refused { refusal: r.clone() }, ..held });
-            return Ok(Err(refusal(id, &r)));
+            return self.expire(bot, id, &key, expires_at).await;
         }
 
         let (b, k, t) = (bot.to_string(), key.clone(), held.tx.clone());
@@ -357,10 +417,15 @@ impl Executor {
             Ok(a) => a,
             Err(r) => return Ok(Err(refusal(id, &r))),
         };
-        // Two decisions posted at once both pass the check above; only one may act.
-        let Some(held) = self.claim(&key)? else {
-            let r = Refusal::new(RefusalCode::BadApproval, format!("request {id} was already decided"));
-            return Ok(Err(refusal(id, &r)));
+        // Two decisions posted at once both pass the check above; only one may act. The deadline
+        // is checked again here, and only this hold (same `expires_at`) can be claimed.
+        let held = match self.claim(&key, expires_at)? {
+            Claim::Ready(held) => *held,
+            Claim::Expired => return self.expire(bot, id, &key, expires_at).await,
+            Claim::Unavailable => {
+                let r = Refusal::new(RefusalCode::BadApproval, format!("request {id} was already decided"));
+                return Ok(Err(refusal(id, &r)));
+            }
         };
         match decision {
             Decision::Deny => {
