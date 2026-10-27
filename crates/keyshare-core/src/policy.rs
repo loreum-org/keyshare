@@ -286,7 +286,13 @@ impl PlainPolicy {
             let value_out = prices.value_usd(tx.chain_id, Some(p.tokenOut), p.amountOutMinimum).ok_or_else(|| {
                 refuse(RefusalCode::PriceUnavailable, format!("swap output token {} has no USD price", p.tokenOut))
             })?;
-            let floor = value_in * UsdMicros::from(10_000 - self.max_price_deviation_bps.min(10_000)) / 10_000;
+            // Checked: a wrapping multiply in release builds made the floor tiny and let a huge
+            // input through with almost no minimum output.
+            let keep_bps = UsdMicros::from(10_000 - self.max_price_deviation_bps.min(10_000));
+            let floor = value_in
+                .checked_mul(keep_bps)
+                .map(|v| v / 10_000)
+                .ok_or_else(|| refuse(RefusalCode::Internal, "swap input is too large to value"))?;
             if value_out < floor {
                 return Err(refuse(
                     RefusalCode::SlippageTooHigh,
@@ -559,6 +565,27 @@ mod tests {
         let mut dust = swap(me, USDC, 0);
         dust.value = U256::from(1);
         assert_eq!(code(check(dust)), RefusalCode::SlippageTooHigh);
+    }
+
+    #[test]
+    fn huge_swap_input_does_not_wrap_the_price_floor() {
+        let mut p = policy();
+        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        p.own_address = Some(FRIEND);
+        // USDC is $1 with 6 decimals, so the USD value in micros equals the base amount. This
+        // amount still fits in u128, but amount * 9500 does not.
+        let params = ExactInputSingleParams {
+            tokenIn: USDC,
+            tokenOut: USDC,
+            fee: Default::default(),
+            recipient: FRIEND,
+            amountIn: U256::from(u128::MAX / 2),
+            amountOutMinimum: U256::from(1u64),
+            sqrtPriceLimitX96: Default::default(),
+        };
+        let t = tx(ROUTER, U256::ZERO, exactInputSingleCall { params }.abi_encode());
+        let r = p.check(Action::Transaction(&t), 0, &prices());
+        assert_eq!(code(r), RefusalCode::Internal);
     }
 
     #[test]

@@ -269,6 +269,14 @@ async fn approved_agent_signs_orders_within_guardrails() {
 
     let r = call(&f.app, "hl_positions", json!({})).await;
     assert_eq!(r["structuredContent"]["state"]["marginSummary"]["accountValue"], "10000.0");
+
+    // A request id is spent once the agent signs, so a retry cannot place a second order.
+    let mut once = buy("0.1", "2500");
+    once["request_id"] = json!("hl-once");
+    assert_eq!(call(&f.app, "hl_place_order", once.clone()).await["isError"], false);
+    let n = f.venue.lock().unwrap().posted.len();
+    assert_eq!(code(&call(&f.app, "hl_place_order", once).await), "NONCE_REUSED");
+    assert_eq!(f.venue.lock().unwrap().posted.len(), n);
 }
 
 #[tokio::test]

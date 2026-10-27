@@ -133,6 +133,7 @@ pub struct SignTypedDataArgs {
 pub struct HlOrderArgs {
     #[serde(flatten)]
     pub order: OrderSpec,
+    /// Optional idempotency key. A request id can only be used once.
     pub request_id: Option<String>,
 }
 
@@ -142,6 +143,7 @@ pub struct HlModifyArgs {
     pub oid: u64,
     #[serde(flatten)]
     pub order: OrderSpec,
+    /// Optional idempotency key. A request id can only be used once.
     pub request_id: Option<String>,
 }
 
@@ -149,6 +151,7 @@ pub struct HlModifyArgs {
 pub struct HlCancelArgs {
     pub coin: String,
     pub oid: u64,
+    /// Optional idempotency key. A request id can only be used once.
     pub request_id: Option<String>,
 }
 
@@ -159,6 +162,7 @@ pub struct HlLeverageArgs {
     /// Cross margin (default) or isolated.
     #[serde(default = "yes")]
     pub is_cross: bool,
+    /// Optional idempotency key. A request id can only be used once.
     pub request_id: Option<String>,
 }
 

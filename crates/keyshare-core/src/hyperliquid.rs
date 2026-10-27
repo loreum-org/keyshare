@@ -285,8 +285,8 @@ pub struct HlPolicy {
     pub markets: Vec<String>,
     /// Largest single order, size × limit price, in whole USD.
     pub max_order_usd: u64,
-    /// Largest position in one coin after the order fills completely, in whole USD at the order's
-    /// price. Other resting orders are not counted.
+    /// Largest position in one coin after this order and every same-side resting order fill, in
+    /// whole USD at max(limit, mark).
     pub max_position_usd: u64,
     pub max_leverage: u32,
     /// New risk stops once account value falls this far below its value at the first order of

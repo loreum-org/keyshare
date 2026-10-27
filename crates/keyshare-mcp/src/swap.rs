@@ -284,7 +284,12 @@ async fn prepare<'a>(
     let quote = best_quote(p, u, token_in, req.buy_token, amount_in)
         .await
         .ok_or_else(|| Refusal::new(RefusalCode::NoRoute, "no Uniswap v3 pool quotes this pair"))?;
-    let min_out = quote.amount_out * U256::from(10_000 - slippage_bps.min(10_000)) / U256::from(10_000);
+    let keep = U256::from(10_000u32 - slippage_bps.min(10_000));
+    let min_out = quote
+        .amount_out
+        .checked_mul(keep)
+        .and_then(|v| v.checked_div(U256::from(10_000u32)))
+        .ok_or_else(|| Refusal::new(RefusalCode::Internal, "quote is too large to apply slippage"))?;
     Ok((p, u, owner, Plan { token_in, amount_in, buy_decimals, quote, min_out, slippage_bps }))
 }
 
