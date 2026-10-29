@@ -70,10 +70,42 @@ pub struct Limits {
     pub max_slippage_bps: u32,
 }
 
+/// The same address can be a different contract on another chain, so a rule can name the chains
+/// it holds on. Empty means every chain the policy allows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContractRule {
     pub addr: Address,
     pub selectors: Vec<Selector>,
+    #[serde(default)]
+    pub chains: Vec<u64>,
+}
+
+impl ContractRule {
+    fn on(&self, addr: Address, chain_id: u64) -> bool {
+        self.addr == addr && (self.chains.is_empty() || self.chains.contains(&chain_id))
+    }
+}
+
+/// An allowed recipient: a bare address or `{ addr, chains }`. As with contract rules, no chains
+/// (or an empty list) means every chain the policy allows.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RecipientRule {
+    Any(Address),
+    On {
+        addr: Address,
+        #[serde(default)]
+        chains: Vec<u64>,
+    },
+}
+
+impl RecipientRule {
+    fn on(&self, addr: Address, chain_id: u64) -> bool {
+        match self {
+            Self::Any(a) => *a == addr,
+            Self::On { addr: a, chains } => *a == addr && (chains.is_empty() || chains.contains(&chain_id)),
+        }
+    }
 }
 
 /// One allowlisted kind of EIP-712 payload. It must name the domain's `verifying_contract`, so
@@ -147,7 +179,7 @@ pub struct PlainPolicy {
     /// Whole US dollars, rolling 24h.
     pub daily_cap_usd: u64,
     #[serde(default)]
-    pub recipients_allow: Vec<Address>,
+    pub recipients_allow: Vec<RecipientRule>,
     #[serde(default)]
     pub contracts_allow: Vec<ContractRule>,
     /// EIP-712 payloads this bot may sign, each bound to a primary type and its domain.
@@ -190,20 +222,23 @@ impl PlainPolicy {
         }
     }
 
-    fn check_recipient(&self, to: Address, approved: bool) -> Result<(), Refusal> {
-        if approved || self.recipients_allow.contains(&to) {
+    fn check_recipient(&self, chain_id: u64, to: Address, approved: bool) -> Result<(), Refusal> {
+        if approved || self.recipients_allow.iter().any(|r| r.on(to, chain_id)) {
             Ok(())
         } else {
-            Err(refuse(RefusalCode::RecipientNotAllowed, format!("recipient {to} is not allowlisted")))
+            Err(refuse(
+                RefusalCode::RecipientNotAllowed,
+                format!("recipient {to} is not allowlisted on chain {chain_id}"),
+            ))
         }
     }
 
-    fn contract_allows(&self, to: Address, selector: Selector) -> bool {
-        self.contracts_allow.iter().any(|r| r.addr == to && r.selectors.contains(&selector))
+    fn contract_allows(&self, chain_id: u64, to: Address, selector: Selector) -> bool {
+        self.contracts_allow.iter().any(|r| r.on(to, chain_id) && r.selectors.contains(&selector))
     }
 
-    fn is_allowlisted_contract(&self, addr: Address) -> bool {
-        self.contracts_allow.iter().any(|r| r.addr == addr)
+    fn is_allowlisted_contract(&self, chain_id: u64, addr: Address) -> bool {
+        self.contracts_allow.iter().any(|r| r.on(addr, chain_id))
     }
 
     fn price(prices: &dyn PriceSource, chain: u64, token: Option<Address>, amount: U256) -> Result<UsdMicros, Refusal> {
@@ -231,7 +266,7 @@ impl PlainPolicy {
         let data = tx.input.as_ref();
 
         if data.is_empty() {
-            self.check_recipient(to, approved)?;
+            self.check_recipient(tx.chain_id, to, approved)?;
             return Ok(native);
         }
 
@@ -246,14 +281,17 @@ impl PlainPolicy {
         if selector == setApprovalForAllCall::SELECTOR {
             return Err(refuse(RefusalCode::DeniedPrimitive, "setApprovalForAll is always denied"));
         }
-        if !approved && !self.contract_allows(to, selector) {
-            return Err(refuse(RefusalCode::ContractNotAllowed, format!("call {selector} on {to} is not allowlisted")));
+        if !approved && !self.contract_allows(tx.chain_id, to, selector) {
+            return Err(refuse(
+                RefusalCode::ContractNotAllowed,
+                format!("call {selector} on {to} is not allowlisted on chain {}", tx.chain_id),
+            ));
         }
 
         let token_outflow = if selector == transferCall::SELECTOR {
             let call = transferCall::abi_decode(data)
                 .map_err(|e| refuse(RefusalCode::ContractNotAllowed, format!("bad transfer calldata: {e}")))?;
-            self.check_recipient(call.to, approved)?;
+            self.check_recipient(tx.chain_id, call.to, approved)?;
             Self::price(prices, tx.chain_id, Some(to), call.amount)?
         } else if selector == approveCall::SELECTOR {
             let call = approveCall::abi_decode(data)
@@ -261,10 +299,10 @@ impl PlainPolicy {
             if call.amount == U256::MAX {
                 return Err(refuse(RefusalCode::DeniedPrimitive, "unlimited approve is denied"));
             }
-            if !approved && !self.is_allowlisted_contract(call.spender) {
+            if !approved && !self.is_allowlisted_contract(tx.chain_id, call.spender) {
                 return Err(refuse(
                     RefusalCode::ContractNotAllowed,
-                    format!("approve spender {} is not an allowlisted contract", call.spender),
+                    format!("approve spender {} is not an allowlisted contract on chain {}", call.spender, tx.chain_id),
                 ));
             }
             // An approval can move that much later, so it counts as outflow now.
@@ -275,7 +313,7 @@ impl PlainPolicy {
             let p = &call.params;
             // The input was already counted (approve, or native value); the output must not leave.
             if Some(p.recipient) != self.own_address {
-                self.check_recipient(p.recipient, approved)?;
+                self.check_recipient(tx.chain_id, p.recipient, approved)?;
             }
             // The guaranteed output must be worth close to the input at configured prices. This
             // binds every route to the router, not only the swap tool: no zero minimum, no
@@ -500,6 +538,42 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_entries_can_be_tied_to_chains() {
+        const OTHER: u64 = 11155111;
+        let p: PlainPolicy = toml::from_str(&format!(
+            r#"
+            chains = [{CHAIN}, {OTHER}]
+            per_tx_cap_usd = 200
+            daily_cap_usd = 500
+            recipients_allow = ["{ROUTER}", {{ addr = "{FRIEND}", chains = [{CHAIN}] }}, {{ addr = "{USDC}", chains = [] }}, {{ addr = "{STRANGER}" }}]
+            [[contracts_allow]]
+            addr = "{USDC}"
+            selectors = ["0xa9059cbb"]
+            chains = [{CHAIN}]
+            "#
+        ))
+        .expect("policy toml");
+        let prices = PriceTable::from_entries(&[
+            PriceEntry { chain_id: CHAIN, token: None, decimals: 18, usd: "2000".into() },
+            PriceEntry { chain_id: OTHER, token: None, decimals: 18, usd: "2000".into() },
+            PriceEntry { chain_id: CHAIN, token: Some(USDC), decimals: 6, usd: "1".into() },
+            PriceEntry { chain_id: OTHER, token: Some(USDC), decimals: 6, usd: "1".into() },
+        ])
+        .expect("prices");
+        let on = |chain_id: u64, t: TxEip1559| p.check(Action::Transaction(&TxEip1559 { chain_id, ..t }), 0, &prices);
+        // FRIEND is allowed only on CHAIN; a bare address holds on every chain.
+        assert!(on(CHAIN, tx(FRIEND, eth(1), vec![])).is_ok());
+        assert_eq!(code(on(OTHER, tx(FRIEND, eth(1), vec![]))), RefusalCode::RecipientNotAllowed);
+        assert!(on(OTHER, tx(ROUTER, eth(1), vec![])).is_ok());
+        // An empty list means every chain, as for contract rules.
+        assert!(on(OTHER, tx(USDC, eth(1), vec![])).is_ok());
+        assert!(on(OTHER, tx(STRANGER, eth(1), vec![])).is_ok());
+        // The same USDC address on another chain may be another contract.
+        assert!(on(CHAIN, usdc_transfer(ROUTER, 1)).is_ok());
+        assert_eq!(code(on(OTHER, usdc_transfer(ROUTER, 1))), RefusalCode::ContractNotAllowed);
+    }
+
+    #[test]
     fn native_send_to_allowlisted_recipient() {
         // 0.05 ETH = $100
         assert_eq!(check(&tx(FRIEND, eth(50), vec![]), 0).unwrap().outflow_usd, 100 * MICROS_PER_USD);
@@ -538,7 +612,11 @@ mod tests {
     #[test]
     fn swap_output_goes_to_self_or_an_allowlisted_recipient() {
         let mut p = policy();
-        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        p.contracts_allow.push(ContractRule {
+            addr: ROUTER,
+            selectors: vec![exactInputSingleCall::SELECTOR.into()],
+            chains: vec![],
+        });
         let me = address!("0x9999999999999999999999999999999999999999");
         p.own_address = Some(me);
         // 100 USDC in; `out` USDC-units out (USDC to USDC keeps the price math obvious).
@@ -570,7 +648,11 @@ mod tests {
     #[test]
     fn huge_swap_input_does_not_wrap_the_price_floor() {
         let mut p = policy();
-        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        p.contracts_allow.push(ContractRule {
+            addr: ROUTER,
+            selectors: vec![exactInputSingleCall::SELECTOR.into()],
+            chains: vec![],
+        });
         p.own_address = Some(FRIEND);
         // USDC is $1 with 6 decimals, so the USD value in micros equals the base amount. This
         // amount still fits in u128, but amount * 9500 does not.
@@ -618,7 +700,11 @@ mod tests {
     fn unpriced_token_is_refused() {
         let mut p = policy();
         let other = address!("0x3333333333333333333333333333333333333333");
-        p.contracts_allow.push(ContractRule { addr: other, selectors: vec![transferCall::SELECTOR.into()] });
+        p.contracts_allow.push(ContractRule {
+            addr: other,
+            selectors: vec![transferCall::SELECTOR.into()],
+            chains: vec![],
+        });
         let data = transferCall { to: FRIEND, amount: U256::from(1) }.abi_encode();
         let r = p.check(Action::Transaction(&tx(other, U256::ZERO, data)), 0, &prices());
         assert_eq!(code(r), RefusalCode::PriceUnavailable);

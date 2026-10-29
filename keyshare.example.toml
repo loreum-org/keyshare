@@ -57,6 +57,8 @@ admin_keys = []
 chains = [11155111]
 per_tx_cap_usd = 200
 daily_cap_usd = 500
+# A bare address is allowed on every chain above; tie one to chains with
+#   { addr = "0x...", chains = [11155111] }
 recipients_allow = []
 # EIP-712 payloads this bot may sign, each bound to its domain, e.g.
 #   [[bots.filltape.policy.typed_data_allow]]
@@ -72,10 +74,12 @@ max_price_deviation_bps = 500  # swap minimum output must be within 5% of the in
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
 selectors = ["0xa9059cbb", "0x095ea7b3"]   # USDC transfer, approve (exact amounts only)
+chains = [11155111]            # this address is Sepolia USDC; leave out to allow on every chain
 
 [[bots.filltape.policy.contracts_allow]]
 addr = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
 selectors = ["0x04e45aaf"]     # Uniswap SwapRouter02 exactInputSingle
+chains = [11155111]
 # Only exactInputSingle is checked against prices. Don't allowlist the router's other
 # selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
 
