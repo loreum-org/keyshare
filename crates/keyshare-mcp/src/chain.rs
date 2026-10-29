@@ -24,9 +24,30 @@ sol! {
 pub struct ChainConfig {
     pub id: u64,
     pub rpc_url: String,
+    /// Uniswap v3 contracts for the `swap` tool. Without them `swap` refuses this chain.
+    pub uniswap_v3: Option<UniswapV3>,
 }
 
-pub struct Chains(HashMap<u64, RootProvider>);
+/// SwapRouter02, QuoterV2 and the wrapped native token on one chain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniswapV3 {
+    pub router: Address,
+    pub quoter: Address,
+    pub weth: Address,
+    /// Pool fee tiers to quote, in hundredths of a bip. Default 500, 3000, 10000.
+    #[serde(default = "default_fee_tiers")]
+    pub fee_tiers: Vec<u32>,
+}
+
+fn default_fee_tiers() -> Vec<u32> {
+    vec![500, 3000, 10000]
+}
+
+pub struct Chains {
+    providers: HashMap<u64, RootProvider>,
+    uniswap: HashMap<u64, UniswapV3>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Simulation {
@@ -39,7 +60,7 @@ pub struct Simulation {
 /// A failed RPC call. The node's own error message is passed on to the bot, but a transport error
 /// is not: its text carries the RPC URL, which may hold the operator's API key. That detail goes
 /// to the server log only.
-fn rpc_err(e: TransportError) -> Refusal {
+pub fn rpc_err(e: TransportError) -> Refusal {
     match e.as_error_resp() {
         Some(resp) => Refusal::new(RefusalCode::RpcUnavailable, format!("rpc: {}", resp.message)),
         None => {
@@ -50,29 +71,38 @@ fn rpc_err(e: TransportError) -> Refusal {
 }
 
 /// A bad answer from the RPC (no secrets in it).
-fn rpc_bad(why: impl std::fmt::Display) -> Refusal {
+pub fn rpc_bad(why: impl std::fmt::Display) -> Refusal {
     Refusal::new(RefusalCode::RpcUnavailable, format!("rpc: {why}"))
 }
 
 impl Chains {
     pub fn new(configs: &[ChainConfig]) -> Result<Self, String> {
-        let mut map = HashMap::new();
+        let (mut providers, mut uniswap) = (HashMap::new(), HashMap::new());
         for c in configs {
             let url = c.rpc_url.parse().map_err(|e| format!("chain {}: bad rpc_url: {e}", c.id))?;
-            map.insert(c.id, RootProvider::new_http(url));
+            providers.insert(c.id, RootProvider::new_http(url));
+            if let Some(u) = &c.uniswap_v3 {
+                uniswap.insert(c.id, u.clone());
+            }
         }
-        Ok(Self(map))
+        Ok(Self { providers, uniswap })
     }
 
     pub fn ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.0.keys().copied().collect();
+        let mut ids: Vec<u64> = self.providers.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
 
     pub fn get(&self, chain_id: u64) -> Result<&RootProvider, Refusal> {
-        self.0.get(&chain_id).ok_or_else(|| {
+        self.providers.get(&chain_id).ok_or_else(|| {
             Refusal::new(RefusalCode::ChainNotAllowed, format!("no RPC configured for chain {chain_id}"))
+        })
+    }
+
+    pub fn uniswap(&self, chain_id: u64) -> Result<&UniswapV3, Refusal> {
+        self.uniswap.get(&chain_id).ok_or_else(|| {
+            Refusal::new(RefusalCode::NoRoute, format!("no swap router configured for chain {chain_id}"))
         })
     }
 }
@@ -163,8 +193,12 @@ mod tests {
     #[tokio::test]
     async fn rpc_url_never_reaches_the_bot() {
         // Nothing listens on port 9, so every call is a transport error.
-        let chains = Chains::new(&[ChainConfig { id: 1, rpc_url: "http://127.0.0.1:9/v2/SECRET_API_KEY".into() }])
-            .expect("chains");
+        let chains = Chains::new(&[ChainConfig {
+            id: 1,
+            rpc_url: "http://127.0.0.1:9/v2/SECRET_API_KEY".into(),
+            uniswap_v3: None,
+        }])
+        .expect("chains");
         let p = chains.get(1).expect("provider");
         let refusals = [
             balance(p, Address::ZERO, None).await.unwrap_err(),

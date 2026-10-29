@@ -74,7 +74,12 @@ impl SpendLog {
         let behind = |why: String| Refusal::new(RefusalCode::CounterBehindAnchor, why);
         let anchored: Head = match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| behind(format!("unreadable anchor: {e}")))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // No anchor is fine only for a log that has never recorded anything; otherwise the
+            // anchor was deleted, which is how a rollback would hide.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.log.head().seq == 0 => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(behind(format!("anchor is missing but the spend log is at seq {}", self.log.head().seq)));
+            }
             Err(e) => return Err(behind(format!("unreadable anchor: {e}"))),
         };
         match self.log.hash_at(anchored.seq) {
@@ -99,11 +104,14 @@ impl SpendLog {
     }
 }
 
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(tmp, path)
+    std::fs::rename(tmp, path)?;
+    // Sync the directory too, so the rename itself survives a crash.
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -153,7 +161,15 @@ mod tests {
 
         // Roll the spend log back to the earlier snapshot; the anchor still has seq 2.
         std::fs::write(&path, snapshot).unwrap();
-        let log = SpendLog::open(&path, Some(anchor)).unwrap();
+        let log = SpendLog::open(&path, Some(anchor.clone())).unwrap();
         assert_eq!(log.check_anchor().unwrap_err().code, RefusalCode::CounterBehindAnchor);
+
+        // Deleting the anchor doesn't help: a non-empty log with no anchor is refused.
+        std::fs::remove_file(&anchor).unwrap();
+        let log = SpendLog::open(&path, Some(anchor.clone())).unwrap();
+        assert_eq!(log.check_anchor().unwrap_err().code, RefusalCode::CounterBehindAnchor);
+        // A fresh wallet has neither, and that's fine.
+        let fresh = SpendLog::open(dir.path().join("fresh.jsonl"), Some(dir.path().join("fresh.anchor"))).unwrap();
+        assert!(fresh.check_anchor().is_ok());
     }
 }

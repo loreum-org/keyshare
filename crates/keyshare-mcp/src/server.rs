@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 use crate::auth::Caller;
 use crate::chain;
 use crate::exec::{Executor, Outcome, RequestState, now, scoped, usd};
+use crate::hl::{Hyperliquid, OrderSpec};
+use crate::swap::{self, SwapRequest};
 
 sol! { function transfer(address to, uint256 amount); }
 
@@ -69,6 +71,27 @@ pub struct CallArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SwapArgs {
+    pub chain_id: u64,
+    /// ERC-20 to sell. Omit to sell the chain's native token.
+    #[schemars(with = "Option<String>")]
+    pub sell_token: Option<Address>,
+    /// ERC-20 to buy (use the wrapped token for native).
+    #[schemars(with = "String")]
+    pub buy_token: Address,
+    /// Decimal amount to sell, in whole tokens.
+    pub amount: String,
+    /// Default and maximum: this bot's policy limit.
+    pub max_slippage_bps: Option<u32>,
+    /// Only "uniswap_v3" for now.
+    pub route_provider: Option<String>,
+    /// Quote and check only. Nothing is signed.
+    #[serde(default)]
+    pub dry_run: bool,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SimulateArgs {
     pub chain_id: u64,
     #[schemars(with = "String")]
@@ -104,6 +127,47 @@ pub struct SignTypedDataArgs {
     pub typed_data: Value,
     /// Optional idempotency key. A request id can only be used once.
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HlOrderArgs {
+    #[serde(flatten)]
+    pub order: OrderSpec,
+    /// Optional idempotency key. A request id can only be used once.
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HlModifyArgs {
+    /// Order id of the resting order to replace.
+    pub oid: u64,
+    #[serde(flatten)]
+    pub order: OrderSpec,
+    /// Optional idempotency key. A request id can only be used once.
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HlCancelArgs {
+    pub coin: String,
+    pub oid: u64,
+    /// Optional idempotency key. A request id can only be used once.
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HlLeverageArgs {
+    pub coin: String,
+    pub leverage: u32,
+    /// Cross margin (default) or isolated.
+    #[serde(default = "yes")]
+    pub is_cross: bool,
+    /// Optional idempotency key. A request id can only be used once.
+    pub request_id: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn caller(parts: &http::request::Parts) -> Result<String, ErrorData> {
@@ -156,6 +220,13 @@ impl KeyshareServer {
         f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
     ) -> Result<T, ErrorData> {
         self.exec.with_wallet(f).await.map_err(internal)
+    }
+
+    fn hl(&self) -> Result<&Hyperliquid, CallToolResult> {
+        self.exec
+            .hl
+            .as_deref()
+            .ok_or_else(|| refused("", Refusal::new(RefusalCode::MarketNotAllowed, "Hyperliquid is not configured")))
     }
 
     async fn submit(
@@ -331,6 +402,28 @@ impl KeyshareServer {
     }
 
     #[tool(
+        description = "Swap an exact amount on Uniswap v3. Quotes first; the output always comes back to this wallet with at most max_slippage_bps below the quote. Approves the router for exactly the amount if needed."
+    )]
+    async fn swap(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<SwapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let id = new_request_id(args.request_id);
+        let req = SwapRequest {
+            chain_id: args.chain_id,
+            sell_token: args.sell_token,
+            buy_token: args.buy_token,
+            amount: args.amount,
+            max_slippage_bps: args.max_slippage_bps,
+            route_provider: args.route_provider,
+            dry_run: args.dry_run,
+        };
+        swap::swap(&self.exec, &caller, &id, req).await.map(to_result).map_err(internal)
+    }
+
+    #[tool(
         description = "Status of a request or transaction: pending_user_approval, executing (owner approved, being sent), refused, pending, confirmed, failed or unknown."
     )]
     async fn tx_status(
@@ -397,6 +490,86 @@ impl KeyshareServer {
             Err(r) => refused(&id, r),
         })
         .await
+    }
+
+    #[tool(description = "Hyperliquid testnet: positions, margin and open orders of this bot's account.")]
+    async fn hl_positions(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let hl = match self.hl() {
+            Ok(h) => h,
+            Err(e) => return Ok(e),
+        };
+        Ok(to_result(hl.positions(&self.exec, &caller).await))
+    }
+
+    #[tool(
+        description = "Hyperliquid testnet: place a limit or trigger (tp/sl) order. Checked against this bot's markets, size caps and daily loss stop. Sizes and prices are decimal strings."
+    )]
+    async fn hl_place_order(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<HlOrderArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let hl = match self.hl() {
+            Ok(h) => h,
+            Err(e) => return Ok(e),
+        };
+        let id = new_request_id(args.request_id);
+        hl.place_order(&self.exec, &caller, &id, args.order).await.map(to_result).map_err(internal)
+    }
+
+    #[tool(
+        description = "Hyperliquid testnet: replace a resting order. The new order gets the same checks as a new one."
+    )]
+    async fn hl_modify(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<HlModifyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let hl = match self.hl() {
+            Ok(h) => h,
+            Err(e) => return Ok(e),
+        };
+        let id = new_request_id(args.request_id);
+        hl.modify(&self.exec, &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
+    }
+
+    #[tool(description = "Hyperliquid testnet: cancel a resting order by coin and order id.")]
+    async fn hl_cancel(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<HlCancelArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let hl = match self.hl() {
+            Ok(h) => h,
+            Err(e) => return Ok(e),
+        };
+        let id = new_request_id(args.request_id);
+        hl.cancel(&self.exec, &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
+    }
+
+    #[tool(description = "Hyperliquid testnet: set leverage for a coin, up to this bot's maximum.")]
+    async fn hl_set_leverage(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<HlLeverageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let hl = match self.hl() {
+            Ok(h) => h,
+            Err(e) => return Ok(e),
+        };
+        let id = new_request_id(args.request_id);
+        hl.set_leverage(&self.exec, &caller, &id, &args.coin, args.leverage, args.is_cross)
+            .await
+            .map(to_result)
+            .map_err(internal)
     }
 }
 

@@ -15,6 +15,18 @@ sol! {
     function transfer(address to, uint256 amount);
     function approve(address spender, uint256 amount);
     function setApprovalForAll(address operator, bool approved);
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    /// Uniswap SwapRouter02.
+    function exactInputSingle(ExactInputSingleParams params);
 }
 
 pub type Selector = FixedBytes<4>;
@@ -55,6 +67,7 @@ pub struct Limits {
     pub recipients_allowed: usize,
     pub contracts_allowed: usize,
     pub typed_data_allowed: usize,
+    pub max_slippage_bps: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +75,67 @@ pub struct ContractRule {
     pub addr: Address,
     pub selectors: Vec<Selector>,
 }
+
+/// One allowlisted kind of EIP-712 payload. It must name the domain's `verifying_contract`, so
+/// another protocol's `Order` doesn't match. A domain `name` alone is enough only for domains
+/// with no `chainId` (and so a `chainless` rule), since any contract can declare any name. Typed data with no `chainId` in its
+/// domain matches only a rule marked `chainless`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedDataRule {
+    pub primary_type: String,
+    pub verifying_contract: Option<Address>,
+    pub name: Option<String>,
+    /// Required chain. Default: any of the policy's chains.
+    pub chain_id: Option<u64>,
+    #[serde(default)]
+    pub chainless: bool,
+}
+
+impl TypedDataRule {
+    fn matches(&self, data: &TypedData) -> bool {
+        let d = &data.domain;
+        let bound = self.verifying_contract.is_some() || (self.name.is_some() && d.chain_id.is_none());
+        let chain_ok = match (d.chain_id, self.chain_id) {
+            (None, _) => self.chainless,
+            (Some(c), Some(want)) => c == U256::from(want),
+            (Some(_), None) => true,
+        };
+        bound
+            && chain_ok
+            && self.primary_type == data.primary_type
+            && self.verifying_contract.is_none_or(|v| d.verifying_contract == Some(v))
+            && self.name.as_deref().is_none_or(|n| d.name.as_deref() == Some(n))
+    }
+}
+
+/// Typed data that moves funds: never signed as raw typed data, because the policy can't value
+/// it against the caps. Hyperliquid user-signed actions go through the `hl_*` tools instead.
+fn moves_funds(primary_type: &str) -> bool {
+    primary_type.starts_with("HyperliquidTransaction:")
+        || matches!(
+            primary_type,
+            "Permit"
+                | "PermitSingle"
+                | "PermitBatch"
+                | "PermitTransferFrom"
+                | "PermitBatchTransferFrom"
+                | "PermitWitnessTransferFrom"
+                | "PermitBatchWitnessTransferFrom"
+        )
+}
+
+/// Token functions that move or grant funds in ways the policy doesn't decode yet.
+const UNDECODED_TOKEN_SELECTORS: [[u8; 4]; 8] = [
+    [0x23, 0xb8, 0x72, 0xdd], // transferFrom (ERC-20 and ERC-721)
+    [0x39, 0x50, 0x93, 0x51], // increaseAllowance
+    [0xd5, 0x05, 0xac, 0xcf], // permit (EIP-2612)
+    [0x8f, 0xcb, 0xaf, 0x0c], // permit (DAI)
+    [0x42, 0x84, 0x2e, 0x0e], // safeTransferFrom(address,address,uint256)
+    [0xb8, 0x8d, 0x4f, 0xde], // safeTransferFrom(address,address,uint256,bytes)
+    [0xf2, 0x42, 0x43, 0x2a], // safeTransferFrom (ERC-1155)
+    [0x2e, 0xb2, 0xc2, 0xd6], // safeBatchTransferFrom (ERC-1155)
+];
 
 /// Deny-by-default rules for one bot's wallet.
 #[derive(Debug, Clone, Deserialize)]
@@ -76,12 +150,31 @@ pub struct PlainPolicy {
     pub recipients_allow: Vec<Address>,
     #[serde(default)]
     pub contracts_allow: Vec<ContractRule>,
-    /// EIP-712 primary types this bot may sign, e.g. "HyperliquidTransaction:UsdSend".
+    /// EIP-712 payloads this bot may sign, each bound to a primary type and its domain.
     #[serde(default)]
-    pub typed_data_allow: Vec<String>,
+    pub typed_data_allow: Vec<TypedDataRule>,
     /// Sends worth more than this (whole USD) need the owner's approval even inside the caps.
     #[serde(default)]
     pub require_admin_cosign_above_usd: Option<u64>,
+    /// Most slippage a swap may accept, in basis points (100 = 1%).
+    #[serde(default = "default_slippage_bps")]
+    pub max_slippage_bps: u32,
+    /// A swap's minimum output, valued at configured prices, may be at most this far under its
+    /// input (basis points). Covers slippage, pool fee and price-table drift. Default 500.
+    #[serde(default = "default_price_deviation_bps")]
+    pub max_price_deviation_bps: u32,
+    /// The wallet's own address, set when the wallet is built. Swap output may go here without
+    /// being on `recipients_allow`.
+    #[serde(skip)]
+    pub own_address: Option<Address>,
+}
+
+fn default_slippage_bps() -> u32 {
+    100
+}
+
+fn default_price_deviation_bps() -> u32 {
+    500
 }
 
 fn refuse(code: RefusalCode, reason: impl Into<String>) -> Refusal {
@@ -147,6 +240,9 @@ impl PlainPolicy {
                 .ok_or_else(|| refuse(RefusalCode::ContractNotAllowed, "calldata shorter than a function selector"))?,
         );
 
+        if UNDECODED_TOKEN_SELECTORS.contains(&selector.0) {
+            return Err(refuse(RefusalCode::DeniedPrimitive, format!("{selector} can move funds the caps don't see")));
+        }
         if selector == setApprovalForAllCall::SELECTOR {
             return Err(refuse(RefusalCode::DeniedPrimitive, "setApprovalForAll is always denied"));
         }
@@ -173,6 +269,42 @@ impl PlainPolicy {
             }
             // An approval can move that much later, so it counts as outflow now.
             Self::price(prices, tx.chain_id, Some(to), call.amount)?
+        } else if selector == exactInputSingleCall::SELECTOR {
+            let call = exactInputSingleCall::abi_decode(data)
+                .map_err(|e| refuse(RefusalCode::ContractNotAllowed, format!("bad swap calldata: {e}")))?;
+            let p = &call.params;
+            // The input was already counted (approve, or native value); the output must not leave.
+            if Some(p.recipient) != self.own_address {
+                self.check_recipient(p.recipient, approved)?;
+            }
+            // The guaranteed output must be worth close to the input at configured prices. This
+            // binds every route to the router, not only the swap tool: no zero minimum, no
+            // unpriced output token, no quote taken from an already-pushed pool.
+            // The larger of what is sent and what the router may pull: SwapRouter02 takes
+            // `amountIn` of `tokenIn` by transferFrom when `msg.value` doesn't cover it.
+            let value_in = native.max(Self::price(prices, tx.chain_id, Some(p.tokenIn), p.amountIn)?);
+            let value_out = prices.value_usd(tx.chain_id, Some(p.tokenOut), p.amountOutMinimum).ok_or_else(|| {
+                refuse(RefusalCode::PriceUnavailable, format!("swap output token {} has no USD price", p.tokenOut))
+            })?;
+            // Checked: a wrapping multiply in release builds made the floor tiny and let a huge
+            // input through with almost no minimum output.
+            let keep_bps = UsdMicros::from(10_000 - self.max_price_deviation_bps.min(10_000));
+            let floor = value_in
+                .checked_mul(keep_bps)
+                .map(|v| v / 10_000)
+                .ok_or_else(|| refuse(RefusalCode::Internal, "swap input is too large to value"))?;
+            if value_out < floor {
+                return Err(refuse(
+                    RefusalCode::SlippageTooHigh,
+                    format!(
+                        "swap guarantees ${} for ${} in, more than {} bps under configured prices",
+                        usd(value_out),
+                        usd(value_in),
+                        self.max_price_deviation_bps
+                    ),
+                ));
+            }
+            0
         } else {
             // Other allowlisted calls (e.g. a router) count native value only until simulation
             // asset deltas feed the check.
@@ -197,17 +329,23 @@ impl PlainPolicy {
     }
 
     fn check_typed_data(&self, data: &TypedData) -> Result<(), Refusal> {
+        if moves_funds(&data.primary_type) {
+            return Err(refuse(
+                RefusalCode::DeniedPrimitive,
+                format!("typed data {:?} moves funds outside the caps", data.primary_type),
+            ));
+        }
         if let Some(chain) = data.domain.chain_id {
             let chain = u64::try_from(chain)
                 .map_err(|_| refuse(RefusalCode::ChainNotAllowed, "typed-data chainId out of range"))?;
             self.check_chain(chain)?;
         }
-        if self.typed_data_allow.contains(&data.primary_type) {
+        if self.typed_data_allow.iter().any(|r| r.matches(data)) {
             Ok(())
         } else {
             Err(refuse(
                 RefusalCode::TypedDataNotAllowed,
-                format!("typed data {:?} is not allowlisted", data.primary_type),
+                format!("typed data {:?} with this domain is not allowlisted", data.primary_type),
             ))
         }
     }
@@ -287,6 +425,7 @@ impl PolicyEngine for PlainPolicy {
             recipients_allowed: self.recipients_allow.len(),
             contracts_allowed: self.contracts_allow.len(),
             typed_data_allowed: self.typed_data_allow.len(),
+            max_slippage_bps: self.max_slippage_bps,
         }
     }
 }
@@ -314,7 +453,10 @@ mod tests {
             per_tx_cap_usd = 200
             daily_cap_usd = 500
             recipients_allow = ["{FRIEND}"]
-            typed_data_allow = ["Order"]
+            [[typed_data_allow]]
+            primary_type = "Order"
+            verifying_contract = "{ROUTER}"
+            chain_id = {CHAIN}
 
             [[contracts_allow]]
             addr = "{USDC}"
@@ -394,6 +536,59 @@ mod tests {
     }
 
     #[test]
+    fn swap_output_goes_to_self_or_an_allowlisted_recipient() {
+        let mut p = policy();
+        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        let me = address!("0x9999999999999999999999999999999999999999");
+        p.own_address = Some(me);
+        // 100 USDC in; `out` USDC-units out (USDC to USDC keeps the price math obvious).
+        let swap = |recipient, token_out, out: u64| {
+            let params = ExactInputSingleParams {
+                tokenIn: USDC,
+                tokenOut: token_out,
+                fee: Default::default(),
+                recipient,
+                amountIn: U256::from(100_000_000u64),
+                amountOutMinimum: U256::from(out),
+                sqrtPriceLimitX96: Default::default(),
+            };
+            tx(ROUTER, U256::ZERO, exactInputSingleCall { params }.abi_encode())
+        };
+        let check = |t: TxEip1559| p.check(Action::Transaction(&t), 0, &prices());
+        assert!(check(swap(me, USDC, 99_000_000)).is_ok());
+        assert!(check(swap(FRIEND, USDC, 95_000_000)).is_ok(), "5% is the default limit");
+        assert_eq!(code(check(swap(STRANGER, USDC, 99_000_000))), RefusalCode::RecipientNotAllowed);
+        assert_eq!(code(check(swap(me, USDC, 94_999_999))), RefusalCode::SlippageTooHigh);
+        assert_eq!(code(check(swap(me, USDC, 0))), RefusalCode::SlippageTooHigh, "no zero minimum");
+        assert_eq!(code(check(swap(me, STRANGER, 99_000_000))), RefusalCode::PriceUnavailable);
+        // A native value of 1 wei can't stand in for the amountIn the router will pull.
+        let mut dust = swap(me, USDC, 0);
+        dust.value = U256::from(1);
+        assert_eq!(code(check(dust)), RefusalCode::SlippageTooHigh);
+    }
+
+    #[test]
+    fn huge_swap_input_does_not_wrap_the_price_floor() {
+        let mut p = policy();
+        p.contracts_allow.push(ContractRule { addr: ROUTER, selectors: vec![exactInputSingleCall::SELECTOR.into()] });
+        p.own_address = Some(FRIEND);
+        // USDC is $1 with 6 decimals, so the USD value in micros equals the base amount. This
+        // amount still fits in u128, but amount * 9500 does not.
+        let params = ExactInputSingleParams {
+            tokenIn: USDC,
+            tokenOut: USDC,
+            fee: Default::default(),
+            recipient: FRIEND,
+            amountIn: U256::from(u128::MAX / 2),
+            amountOutMinimum: U256::from(1u64),
+            sqrtPriceLimitX96: Default::default(),
+        };
+        let t = tx(ROUTER, U256::ZERO, exactInputSingleCall { params }.abi_encode());
+        let r = p.check(Action::Transaction(&t), 0, &prices());
+        assert_eq!(code(r), RefusalCode::Internal);
+    }
+
+    #[test]
     fn unlisted_selector_and_contract_are_refused() {
         let data = setApprovalForAllCall { operator: STRANGER, approved: true }.abi_encode();
         assert_eq!(code(check(&tx(USDC, U256::ZERO, data), 0)), RefusalCode::DeniedPrimitive);
@@ -405,6 +600,12 @@ mod tests {
 
     #[test]
     fn approvals_are_bounded() {
+        let pull = [[0x23, 0xb8, 0x72, 0xdd].as_slice(), &[0u8; 96]].concat();
+        assert_eq!(
+            code(check(&tx(USDC, U256::ZERO, pull), 0)),
+            RefusalCode::DeniedPrimitive,
+            "transferFrom is refused even on an allowlisted token"
+        );
         let unlimited = approveCall { spender: ROUTER, amount: U256::MAX }.abi_encode();
         assert_eq!(code(check(&tx(USDC, U256::ZERO, unlimited), 0)), RefusalCode::DeniedPrimitive);
         let to_stranger = approveCall { spender: STRANGER, amount: U256::from(1) }.abi_encode();
@@ -463,23 +664,74 @@ mod tests {
     #[test]
     fn typed_data_is_deny_by_default() {
         let p = policy();
-        let make = |primary: &str, chain: u64| -> TypedData {
+        let make = |primary: &str, domain: serde_json::Value| -> TypedData {
             serde_json::from_value(serde_json::json!({
                 "types": {
-                    "EIP712Domain": [{"name": "chainId", "type": "uint256"}],
+                    "EIP712Domain": [{"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
                     primary: [{"name": "amount", "type": "uint256"}]
                 },
                 "primaryType": primary,
-                "domain": {"chainId": chain},
+                "domain": domain,
                 "message": {"amount": "1"}
             }))
             .expect("typed data")
         };
-        assert!(p.check(Action::TypedData(&make("Order", CHAIN)), 0, &prices()).is_ok());
+        let ok = serde_json::json!({"chainId": CHAIN, "verifyingContract": ROUTER});
+        let check = |d: &TypedData| p.check(Action::TypedData(d), 0, &prices()).map_err(|r| r.code);
+        assert!(check(&make("Order", ok.clone())).is_ok());
+        assert_eq!(check(&make("Permit", ok.clone())), Err(RefusalCode::DeniedPrimitive));
+        assert_eq!(check(&make("HyperliquidTransaction:UsdSend", ok)), Err(RefusalCode::DeniedPrimitive));
+        // Same type name, another protocol's contract.
+        let other = serde_json::json!({"chainId": CHAIN, "verifyingContract": STRANGER});
+        assert_eq!(check(&make("Order", other)), Err(RefusalCode::TypedDataNotAllowed));
+        // No chainId: only a chainless rule matches.
         assert_eq!(
-            code(p.check(Action::TypedData(&make("Permit", CHAIN)), 0, &prices())),
-            RefusalCode::TypedDataNotAllowed
+            check(&make("Order", serde_json::json!({"verifyingContract": ROUTER}))),
+            Err(RefusalCode::TypedDataNotAllowed)
         );
-        assert_eq!(code(p.check(Action::TypedData(&make("Order", 1)), 0, &prices())), RefusalCode::ChainNotAllowed);
+        assert_eq!(
+            check(&make("Order", serde_json::json!({"chainId": 1, "verifyingContract": ROUTER}))),
+            Err(RefusalCode::ChainNotAllowed)
+        );
+    }
+
+    #[test]
+    fn name_only_rule_needs_chainless() {
+        let rule = |chainless| TypedDataRule {
+            primary_type: "Order".into(),
+            verifying_contract: None,
+            name: Some("Exchange".into()),
+            chain_id: None,
+            chainless,
+        };
+        let data = |domain: serde_json::Value| -> TypedData {
+            serde_json::from_value(serde_json::json!({
+                "types": {"EIP712Domain": [], "Order": [{"name": "amount", "type": "uint256"}]},
+                "primaryType": "Order",
+                "domain": domain,
+                "message": {"amount": "1"}
+            }))
+            .expect("typed data")
+        };
+        // Any contract can call itself "Exchange", so a name-only rule never matches a chain domain.
+        let spoof = data(serde_json::json!({"name": "Exchange", "chainId": CHAIN, "verifyingContract": STRANGER}));
+        assert!(!rule(false).matches(&spoof));
+        assert!(!rule(true).matches(&spoof));
+        assert!(rule(true).matches(&data(serde_json::json!({"name": "Exchange"}))));
+    }
+
+    #[test]
+    fn undecoded_selectors_cover_nft_and_dai_permit() {
+        use alloy::primitives::keccak256;
+        for sig in [
+            "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)",
+            "safeTransferFrom(address,address,uint256)",
+            "safeTransferFrom(address,address,uint256,bytes)",
+            "safeTransferFrom(address,address,uint256,uint256,bytes)",
+            "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+        ] {
+            let sel: [u8; 4] = keccak256(sig)[..4].try_into().unwrap();
+            assert!(UNDECODED_TOKEN_SELECTORS.contains(&sel), "{sig}");
+        }
     }
 }
