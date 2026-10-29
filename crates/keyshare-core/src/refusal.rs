@@ -17,6 +17,11 @@ pub enum RefusalCode {
     PerTxCapExceeded,
     CapExceeded,
     NonceReused,
+    AdminApprovalRequired,
+    BadApproval,
+    UserDenied,
+    TooManyPending,
+    Expired,
     CounterBehindAnchor,
     SimRevert,
     RpcUnavailable,
@@ -30,6 +35,20 @@ pub struct Refusal {
     pub refused: bool,
     pub code: RefusalCode,
     pub reason: String,
+}
+
+impl RefusalCode {
+    /// Refusals the wallet's owner can override with an admin approval (design §13.2).
+    pub fn is_owner_approvable(self) -> bool {
+        matches!(
+            self,
+            Self::RecipientNotAllowed
+                | Self::ContractNotAllowed
+                | Self::PerTxCapExceeded
+                | Self::CapExceeded
+                | Self::AdminApprovalRequired
+        )
+    }
 }
 
 impl Refusal {
