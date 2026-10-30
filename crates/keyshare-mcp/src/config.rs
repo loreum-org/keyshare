@@ -5,11 +5,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
+use keyshare_core::hyperliquid::HlPolicy;
 use keyshare_core::price::PriceEntry;
-use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, StatePaths, Wallet};
+use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
+use crate::hl::{HlConfig, Hyperliquid};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +22,8 @@ pub struct Config {
     pub chains: Vec<ChainConfig>,
     #[serde(default)]
     pub prices: Vec<PriceEntry>,
+    /// Hyperliquid API settings. Bots trade there only with a `[bots.<id>.hyperliquid]` table.
+    pub hyperliquid: Option<HlConfig>,
     /// Keyed by bot id.
     pub bots: HashMap<String, BotConfig>,
 }
@@ -54,6 +58,8 @@ pub struct BotConfig {
     #[serde(default)]
     pub admin_keys: Vec<Address>,
     pub policy: PlainPolicy,
+    /// Hyperliquid testnet guardrails. Without this table the `hl_*` tools refuse this bot.
+    pub hyperliquid: Option<HlPolicy>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +84,22 @@ impl Config {
         toml::from_str(&text).map_err(|e| ConfigError::Parse(path.into(), e))
     }
 
+    /// True when the spend anchor sits inside `state_dir`, where restoring or deleting that one
+    /// directory would defeat the rollback check.
+    pub fn anchor_in_state_dir(&self) -> bool {
+        // Compare resolved paths so `./state/x` or a symlink into state_dir is still caught. A path
+        // that doesn't exist yet resolves through its parent.
+        fn resolve(p: &Path) -> PathBuf {
+            p.canonicalize()
+                .or_else(|_| match (p.parent(), p.file_name()) {
+                    (Some(dir), Some(name)) => dir.canonicalize().map(|d| d.join(name)),
+                    _ => Err(std::io::ErrorKind::NotFound.into()),
+                })
+                .unwrap_or_else(|_| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+        }
+        self.server.spend_anchor.as_ref().is_none_or(|a| resolve(a).starts_with(resolve(&self.server.state_dir)))
+    }
+
     pub fn state_paths(&self) -> StatePaths {
         let dir = &self.server.state_dir;
         StatePaths {
@@ -92,6 +114,10 @@ impl Config {
     pub fn credentials(&self) -> Result<HashMap<B256, String>, ConfigError> {
         let mut out = HashMap::new();
         for (bot, cfg) in &self.bots {
+            // Request ids are scoped as "bot:id"; a ':' in a bot id could collide with another's.
+            if bot.is_empty() || bot.contains(':') {
+                return Err(ConfigError::Other(format!("bot id {bot:?} must be non-empty and contain no ':'")));
+            }
             if let Some(other) = out.insert(cfg.credential_sha256, bot.clone()) {
                 return Err(ConfigError::DuplicateCredential(other, bot.clone()));
             }
@@ -107,11 +133,12 @@ impl Config {
                 .ok_or_else(|| ConfigError::MissingKey { bot: bot.clone(), var: cfg.key_env.clone() })?;
             let signer = LocalSigner::from_hex(&key)
                 .map_err(|e| ConfigError::BadKey { bot: bot.clone(), why: e.to_string() })?;
+            let own = signer.address();
             accounts.insert(
                 bot.clone(),
                 Account {
                     signer: Box::new(signer),
-                    policy: Box::new(cfg.policy.clone()),
+                    policy: Box::new(PlainPolicy { own_address: Some(own), ..cfg.policy.clone() }),
                     admins: cfg.admin_keys.clone(),
                 },
             );
@@ -120,5 +147,12 @@ impl Config {
         std::fs::create_dir_all(&self.server.state_dir)
             .map_err(|e| ConfigError::Read(self.server.state_dir.clone(), e))?;
         Wallet::open(accounts, Box::new(prices), &self.state_paths()).map_err(|e| ConfigError::Other(e.to_string()))
+    }
+
+    pub fn hyperliquid(&self) -> Result<Hyperliquid, ConfigError> {
+        crate::hl::check_api_url(self.hyperliquid.as_ref()).map_err(ConfigError::Other)?;
+        let policies =
+            self.bots.iter().filter_map(|(bot, cfg)| Some((bot.clone(), cfg.hyperliquid.clone()?))).collect();
+        Ok(Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies))
     }
 }

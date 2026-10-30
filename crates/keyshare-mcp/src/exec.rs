@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
+use crate::hl::Hyperliquid;
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
 pub const DEFAULT_HOLD_SECS: u64 = 15 * 60;
@@ -72,6 +73,7 @@ pub struct Executor {
     wallet: Arc<Mutex<Wallet>>,
     pub chains: Arc<Chains>,
     pub tokens: Arc<Vec<PriceEntry>>,
+    pub hl: Option<Arc<Hyperliquid>>,
     /// Held from nonce lookup to broadcast so two sends never get the same nonce.
     send_lock: tokio::sync::Mutex<()>,
     /// Keyed by the caller-scoped request id. In memory: a restart drops held requests, which
@@ -108,10 +110,16 @@ impl Executor {
             wallet,
             chains,
             tokens,
+            hl: None,
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
         }
+    }
+
+    pub fn with_hyperliquid(mut self, hl: Hyperliquid) -> Self {
+        self.hl = Some(Arc::new(hl));
+        self
     }
 
     /// Runs `f` on the wallet off the async runtime (it does fsyncs).
