@@ -32,8 +32,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
-    /// Host header values to accept (DNS-rebinding guard). Empty leaves the guard off, so bind
-    /// `listen` to localhost unless this lists the hosts you actually serve.
+    /// Host header values to accept (DNS-rebinding guard). Empty keeps the default, which accepts
+    /// only localhost, 127.0.0.1 and ::1, so list the hosts you serve when `listen` isn't local.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Holds the spend log, audit log and kill switch file.
