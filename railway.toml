@@ -1,0 +1,10 @@
+# Railway builds the repo-root Dockerfile (not Nixpacks) and checks /health.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "keyshare-mcp serve /etc/keyshare/keyshare.toml"
+healthcheckPath = "/health"
+healthcheckTimeout = 120

@@ -29,6 +29,9 @@ pub fn app(
     allowed_hosts: &[String],
 ) -> Router {
     let mut config = StreamableHttpServerConfig::default();
+    // Empty must not be passed to with_allowed_hosts. rmcp treats an empty list as "allow every
+    // host", which turns the DNS-rebinding guard off. Empty keeps the crate default: localhost,
+    // 127.0.0.1 and ::1. A non-empty list replaces that default with exactly those hosts.
     if !allowed_hosts.is_empty() {
         config = config.with_allowed_hosts(allowed_hosts.iter().cloned());
     }

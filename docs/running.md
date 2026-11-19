@@ -60,11 +60,32 @@ The server binary is `keyshare-mcp`.
 
 ## Deploying
 
-- **Host checks.** By default the server only accepts requests whose Host header is `localhost`, `127.0.0.1` or `::1`. When it sits behind a public domain (for example on Railway), list that domain in `allowed_hosts`.
+- **Listen address.** `listen` in the config is the bind address when `PORT` is unset. When `PORT` is set, the server listens on `0.0.0.0:$PORT` instead. A blank `PORT` counts as unset.
+- **Host checks.** By default the server only accepts `/mcp` requests whose Host header is `localhost`, `127.0.0.1` or `::1`. That DNS-rebinding guard stays on. To serve another hostname, list it in `allowed_hosts` or in `KEYSHARE_ALLOWED_HOSTS` (comma-separated, no scheme). The two lists are merged. A hostname without a port matches that host on any port. When the merged list is empty, the localhost default stays. When it is not empty, that list is the whole allowlist, so include `localhost` too if you still want it.
 - **State folder.** `state_dir` holds the spend log, audit log, kill switch and Hyperliquid agent keys. Put it on a persistent volume. Losing it loses the spend history and the audit trail.
 - **Spend anchor.** Put `spend_anchor` on a different disk from `state_dir`. If the state folder is restored from an old backup, the anchor catches it and signing stops. The server prints a warning at start if the anchor is inside the state folder.
 - **One server per state folder.** Two servers sharing one state folder would each keep their own nonces and in-memory requests.
 - **Restarts.** Requests waiting for the owner live in memory and are dropped on restart. They never sign. The bot has to ask again.
+
+### Railway
+
+Phase 0 can run as a public HTTPS testnet MCP server. Railway terminates TLS. The process speaks HTTP on the port Railway assigns.
+
+The repo root `Dockerfile` is a multi-stage build. It compiles the workspace with Rust 1.90 (the `rust-version` in `Cargo.toml`) and runs `keyshare-mcp` as the user `keyshare` (uid 10001). `railway.toml` selects that Dockerfile as the builder and sets the `/health` healthcheck.
+
+1. Point a Railway service at this repo and leave the builder on the Dockerfile.
+2. Mount a persistent volume at `/data`. That path is `state_dir` in `keyshare.railway.example.toml`, which the image copies to `/etc/keyshare/keyshare.toml` and serves. The volume holds the spend log, audit log, kill switch and Hyperliquid agent keys. The image user must be able to write `/data`. Losing the volume loses that history. Keep the service at one replica.
+3. Set variables in Railway. They never go in the config file or the image.
+   - `FILLTAPE_KEY` is the filltape bot's testnet private key. Any other bot uses the variable named by its `key_env`. The process will not start if a configured key variable is missing.
+   - `KEYSHARE_ALLOWED_HOSTS` is the Railway hostname, for example `keyshare-mcp.up.railway.app`, with no `https://`. Several hosts are comma-separated. This is merged with `allowed_hosts` from the file. The DNS-rebinding guard still rejects any other Host header on `/mcp`.
+   - `PORT` is set by Railway. The process binds `0.0.0.0:$PORT`. You do not pick that port in the file for a Railway deploy. `listen = "0.0.0.0:8080"` in the example is only the fallback when `PORT` is unset.
+4. Healthcheck path: `/health`. It returns `ok`. It is not behind bot auth or the host allowlist, so Railway can call it.
+5. Start command: `keyshare-mcp serve <config>`. The image default, also set in `railway.toml`, is `keyshare-mcp serve /etc/keyshare/keyshare.toml`. To serve a different file (for example one you put on the volume with a real `credential_sha256`), set the start command to `keyshare-mcp serve <config>`.
+6. Bots connect to `https://<railway-domain>/mcp` with `Authorization: Bearer <token>`. The example `credential_sha256` is a placeholder of all zeros and matches no token. Run `keyshare-mcp new-token`, put only the hash in the config the process reads, and give the token to the bot. Do not commit the token.
+7. The filltape bot in the Railway example is Sepolia plus Hyperliquid testnet, with the same policy shape as `keyshare.example.toml`. Fund the address printed at startup with testnet tokens.
+8. One volume means `spend_anchor` sits inside `state_dir`, so startup prints the anchor warning. A second disk is optional.
+
+`/admin/pending` stays off until `admin_token_sha256` is set in the config the server reads.
 
 ## Continuous integration
 

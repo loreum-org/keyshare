@@ -4,7 +4,8 @@
 
 [server]
 listen = "127.0.0.1:8080"
-# Host headers to accept. Add your Railway domain in production. Empty = localhost only.
+# Host headers to accept. Empty = localhost only. A public hostname can go here or in
+# KEYSHARE_ALLOWED_HOSTS (see keyshare.railway.example.toml). The two lists are merged.
 allowed_hosts = []
 state_dir = "./state"
 # Copy of the spend-log head. Put it on another disk so a restored disk image is caught.

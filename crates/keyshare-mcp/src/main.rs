@@ -66,9 +66,18 @@ async fn serve(path: PathBuf) -> Result<()> {
     let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
     let hl = config.hyperliquid()?;
     let exec = Arc::new(Executor::new(Arc::new(Mutex::new(wallet)), chains, tokens, hold).with_hyperliquid(hl));
-    let app = keyshare_mcp::app(exec, creds, config.server.admin_token_sha256, &config.server.allowed_hosts);
-    let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
+    let port = std::env::var("PORT").ok();
+    let listen = config.server.bind_addr(port.as_deref())?;
+    let extra_hosts = std::env::var("KEYSHARE_ALLOWED_HOSTS").ok();
+    let allowed_hosts = config.server.effective_allowed_hosts(extra_hosts.as_deref());
+    let app = keyshare_mcp::app(exec, creds, config.server.admin_token_sha256, &allowed_hosts);
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("listening on {}", listener.local_addr()?);
+    if allowed_hosts.is_empty() {
+        eprintln!("allowed hosts: default (localhost, 127.0.0.1, ::1)");
+    } else {
+        eprintln!("allowed hosts: {}", allowed_hosts.join(", "));
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

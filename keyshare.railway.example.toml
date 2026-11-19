@@ -1,0 +1,108 @@
+# keyshare-mcp on Railway (Phase 0, testnet only). No live secrets in this file.
+# The image runs:  keyshare-mcp serve /etc/keyshare/keyshare.toml
+# Bot private keys stay in environment variables (FILLTAPE_KEY), never here.
+#
+# allowed_hosts and credential hashes are filled at runtime:
+#   KEYSHARE_ALLOWED_HOSTS   comma-separated public hostnames, no scheme
+#   credential_sha256        placeholder below; put the real hash in the config
+#                            this process reads (`keyshare-mcp new-token` prints it)
+# Railway sets PORT. The process then listens on 0.0.0.0:$PORT.
+
+[server]
+# Used when PORT is unset (local `docker run`). On Railway, PORT wins and the
+# process binds 0.0.0.0:$PORT.
+listen = "0.0.0.0:8080"
+# Left empty in git. At startup this list is merged with KEYSHARE_ALLOWED_HOSTS.
+# Set that to the Railway domain, for example keyshare-mcp.up.railway.app.
+# Nothing in either place keeps the DNS-rebinding guard on localhost only.
+allowed_hosts = []
+# Persistent volume on Railway. Holds the spend log, audit log, kill switch and
+# Hyperliquid agent keys.
+state_dir = "/data"
+# Copy of the spend-log head. Put it on another disk so a restored disk image is caught.
+# One Railway volume means the anchor stays inside state_dir and startup warns.
+# spend_anchor = "/mnt/anchor/spend.anchor.json"
+# Token for GET /admin/pending (sha256, from `keyshare-mcp new-token`). Without it the list is off.
+# admin_token_sha256 = "0x..."
+# How long a held request waits for the owner (seconds). Default 900.
+# hold_secs = 900
+
+# Hyperliquid API. Default is testnet; Phase 0 signs for testnet only.
+# [hyperliquid]
+# api_url = "https://api.hyperliquid-testnet.xyz"
+
+# RPC per chain. Chain tools refuse chains not listed here.
+[[chains]]
+id = 11155111                  # Sepolia
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# Uniswap v3 on Sepolia, for the swap tool. Add the router to a bot's contracts_allow to let it swap.
+[chains.uniswap_v3]
+router = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"   # SwapRouter02
+quoter = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"   # QuoterV2
+weth = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+
+# Fixed USD prices for caps (Phase 0). Tokens with no price are refused.
+[[prices]]
+chain_id = 11155111            # Sepolia ETH
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia WETH (swaps can only buy priced tokens)
+token = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia USDC
+token = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+decimals = 6
+usd = "1"
+
+[bots.filltape]
+# Placeholder hash. It matches no token. Replace it in the served config before a bot logs in.
+credential_sha256 = "0x0000000000000000000000000000000000000000000000000000000000000000"
+key_env = "FILLTAPE_KEY"
+# Owner admin keys. With one set, over-limit or unlisted sends wait for the owner's signed
+# approval (POST /admin/decide) instead of being refused.
+admin_keys = []
+
+[bots.filltape.policy]
+chains = [11155111]
+per_tx_cap_usd = 200
+daily_cap_usd = 500
+# A bare address is allowed on every chain above; tie one to chains with
+#   { addr = "0x...", chains = [11155111] }
+recipients_allow = []
+# EIP-712 payloads this bot may sign, each bound to its domain, e.g.
+#   [[bots.filltape.policy.typed_data_allow]]
+#   primary_type = "Order"
+#   verifying_contract = "0x..."   # required; name = "..." alone only works with chainless
+#   chain_id = 11155111            # or chainless = true for domains without a chainId
+# Permits and Hyperliquid user-signed actions are always refused here.
+typed_data_allow = []
+max_slippage_bps = 100         # swaps accept at most 1% below the quote
+max_price_deviation_bps = 500  # swap minimum output must be within 5% of the input at the prices above
+# require_admin_cosign_above_usd = 100   # owner approves anything above this, even inside the caps
+
+[[bots.filltape.policy.contracts_allow]]
+addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+selectors = ["0xa9059cbb", "0x095ea7b3"]   # USDC transfer, approve (exact amounts only)
+chains = [11155111]            # this address is Sepolia USDC; leave out to allow on every chain
+
+[[bots.filltape.policy.contracts_allow]]
+addr = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+selectors = ["0x04e45aaf"]     # Uniswap SwapRouter02 exactInputSingle
+chains = [11155111]
+# Only exactInputSingle is checked against prices. Don't allowlist the router's other
+# selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
+
+# Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
+# agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
+# the size caps and the loss stop.
+[bots.filltape.hyperliquid]
+markets = ["ETH", "BTC"]
+max_order_usd = 1000           # size x limit price
+max_position_usd = 2000        # per coin, after the order fills
+max_leverage = 5
+daily_loss_stop_usd = 100      # vs account value at the first order of the UTC day

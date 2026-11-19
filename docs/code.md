@@ -42,6 +42,8 @@ The server bots talk to, and the command line.
 
 Tests: `tests/connector.rs` (tools, auth, approvals, against a mock RPC), `tests/swap.rs`, `tests/hyperliquid.rs` (against a mock Hyperliquid API).
 
+The repo root `Dockerfile` and `railway.toml` are the Railway image. It builds with Rust 1.90 and runs `keyshare-mcp` as user `keyshare`. `keyshare.railway.example.toml` is the config that image serves. See [Running](running.md).
+
 ## Checks
 
 ```sh
