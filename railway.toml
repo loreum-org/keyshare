@@ -5,6 +5,8 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "keyshare-mcp serve /etc/keyshare/keyshare.toml"
+# Drops to user keyshare, then runs `keyshare-mcp serve <config>`.
+# Uses KEYSHARE_TOML when that variable is set.
+startCommand = "/usr/local/bin/keyshare-entrypoint"
 healthcheckPath = "/health"
 healthcheckTimeout = 120
