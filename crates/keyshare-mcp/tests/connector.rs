@@ -83,10 +83,10 @@ async fn mock_rpc(sent: Arc<Mutex<Vec<Bytes>>>) -> String {
 }
 
 async fn fixture() -> Fixture {
-    fixture_with(DEFAULT_HOLD_SECS).await
+    fixture_with(DEFAULT_HOLD_SECS, &[]).await
 }
 
-async fn fixture_with(hold_secs: u64) -> Fixture {
+async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let rpc_url = mock_rpc(sent.clone()).await;
     let dir = tempfile::tempdir().unwrap();
@@ -154,7 +154,8 @@ async fn fixture_with(hold_secs: u64) -> Fixture {
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
     let tokens = Arc::new(config.prices.clone());
     let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, hold_secs));
-    let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &[]);
+    let hosts: Vec<String> = allowed_hosts.iter().map(|h| (*h).to_string()).collect();
+    let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &hosts);
     Fixture { app, wallet, sent, _dir: dir }
 }
 
@@ -221,6 +222,46 @@ async fn call_as(app: &Router, token: &str, session: Option<&str>, tool: &str, a
     let (status, _, resp) = rpc(app, Some(token), session, body).await;
     assert_eq!(status, StatusCode::OK, "{resp}");
     resp["result"].clone()
+}
+
+async fn status_for_host(app: &Router, host: &str) -> StatusCode {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("host", host)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    resp.status()
+}
+
+#[tokio::test]
+async fn public_host_is_allowlisted_and_other_hosts_stay_forbidden() {
+    let closed = fixture().await;
+    assert_eq!(status_for_host(&closed.app, "evil.example").await, StatusCode::FORBIDDEN);
+    let health = closed
+        .app
+        .clone()
+        .oneshot(Request::get("/health").header("host", "evil.example").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let open = fixture_with(DEFAULT_HOLD_SECS, &["keyshare.up.railway.app"]).await;
+    assert_eq!(status_for_host(&open.app, "keyshare.up.railway.app").await, StatusCode::OK);
+    assert_eq!(status_for_host(&open.app, "keyshare.up.railway.app:443").await, StatusCode::OK);
+    assert_eq!(status_for_host(&open.app, "evil.example").await, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -472,7 +513,7 @@ async fn owner_approves_a_held_send() {
 
 #[tokio::test]
 async fn expired_hold_frees_the_request_id() {
-    let f = fixture_with(0).await;
+    let f = fixture_with(0, &[]).await;
     let s = session_as(&f.app, TRADER_TOKEN).await;
     let args = json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": "held-expire"});
     let first = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args.clone()).await;
@@ -485,7 +526,7 @@ async fn expired_hold_frees_the_request_id() {
 
 #[tokio::test]
 async fn expired_decision_frees_the_request_id() {
-    let f = fixture_with(0).await;
+    let f = fixture_with(0, &[]).await;
     let s = session_as(&f.app, TRADER_TOKEN).await;
     let args = json!({"chain_id": 11155111, "to": ATTACKER, "amount": "0.01", "request_id": "held-expire-decide"});
     let first = call_as(&f.app, TRADER_TOKEN, s.as_deref(), "send", args.clone()).await;

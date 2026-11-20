@@ -31,9 +31,12 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Address and port from the file, for example `127.0.0.1:8080`. [`ServerConfig::bind_addr`]
+    /// listens on `0.0.0.0:$PORT` instead when the `PORT` environment variable is set.
     pub listen: String,
     /// Host header values to accept (DNS-rebinding guard). Empty keeps the default, which accepts
-    /// only localhost, 127.0.0.1 and ::1, so list the hosts you serve when `listen` isn't local.
+    /// only localhost, 127.0.0.1 and ::1. [`ServerConfig::effective_allowed_hosts`] appends
+    /// `KEYSHARE_ALLOWED_HOSTS` so a public hostname does not have to be committed.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Holds the spend log, audit log and kill switch file.
@@ -44,6 +47,45 @@ pub struct ServerConfig {
     pub admin_token_sha256: Option<B256>,
     /// How long a held request waits for the owner. Default 15 minutes.
     pub hold_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// Address to bind. A set `PORT` (Railway injects this) listens on all interfaces at that
+    /// port. Unset or blank keeps `listen` from the file.
+    pub fn bind_addr(&self, port: Option<&str>) -> Result<String, ConfigError> {
+        let Some(raw) = port.map(str::trim).filter(|p| !p.is_empty()) else {
+            return Ok(self.listen.clone());
+        };
+        match raw.parse::<u16>() {
+            Ok(port) if port != 0 => Ok(format!("0.0.0.0:{port}")),
+            _ => Err(ConfigError::Other(format!("PORT {raw:?} is not a TCP port (1-65535)"))),
+        }
+    }
+
+    /// `allowed_hosts` from the file, then any extra comma-separated hosts not already listed.
+    /// Blank pieces are skipped. Duplicates are compared case-insensitively and the first spelling
+    /// is kept. An empty result means "use the localhost default": callers must not pass that
+    /// empty list to rmcp, which would allow every host and turn the DNS-rebinding guard off.
+    pub fn effective_allowed_hosts(&self, extra: Option<&str>) -> Vec<String> {
+        let mut hosts = Vec::new();
+        for host in &self.allowed_hosts {
+            push_allowed_host(&mut hosts, host);
+        }
+        if let Some(extra) = extra {
+            for part in extra.split(',') {
+                push_allowed_host(&mut hosts, part);
+            }
+        }
+        hosts
+    }
+}
+
+fn push_allowed_host(hosts: &mut Vec<String>, raw: &str) {
+    let host = raw.trim();
+    if host.is_empty() || hosts.iter().any(|existing| existing.eq_ignore_ascii_case(host)) {
+        return;
+    }
+    hosts.push(host.to_string());
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,5 +196,75 @@ impl Config {
         let policies =
             self.bots.iter().filter_map(|(bot, cfg)| Some((bot.clone(), cfg.hyperliquid.clone()?))).collect();
         Ok(Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(listen: &str, hosts: &[&str]) -> ServerConfig {
+        ServerConfig {
+            listen: listen.to_string(),
+            allowed_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            state_dir: PathBuf::from("/data"),
+            spend_anchor: None,
+            admin_token_sha256: None,
+            hold_secs: None,
+        }
+    }
+
+    #[test]
+    fn port_overrides_listen_on_all_interfaces() {
+        let cfg = server("127.0.0.1:8080", &[]);
+        assert_eq!(cfg.bind_addr(None).unwrap(), "127.0.0.1:8080");
+        assert_eq!(cfg.bind_addr(Some("")).unwrap(), "127.0.0.1:8080");
+        assert_eq!(cfg.bind_addr(Some("   ")).unwrap(), "127.0.0.1:8080");
+        assert_eq!(cfg.bind_addr(Some("4000")).unwrap(), "0.0.0.0:4000");
+        assert_eq!(cfg.bind_addr(Some(" 8080\n")).unwrap(), "0.0.0.0:8080");
+        assert!(cfg.bind_addr(Some("0")).is_err());
+        assert!(cfg.bind_addr(Some("65536")).is_err());
+        assert!(cfg.bind_addr(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn extra_hosts_merge_without_emptying_the_guard() {
+        let local = server("127.0.0.1:8080", &[]);
+        assert!(local.effective_allowed_hosts(None).is_empty());
+        assert!(local.effective_allowed_hosts(Some(" , , ")).is_empty());
+        let cfg = server("127.0.0.1:8080", &["localhost"]);
+        assert_eq!(cfg.effective_allowed_hosts(Some(" , , ")), vec!["localhost".to_string()]);
+        assert_eq!(
+            cfg.effective_allowed_hosts(Some(" , keyshare.up.railway.app , localhost , ")),
+            vec!["localhost".to_string(), "keyshare.up.railway.app".to_string()]
+        );
+        let mixed = server("127.0.0.1:8080", &["Example.COM"]);
+        assert_eq!(
+            mixed.effective_allowed_hosts(Some("example.com, other.example")),
+            vec!["Example.COM".to_string(), "other.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn railway_example_is_testnet_with_runtime_hosts() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../keyshare.railway.example.toml");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.state_dir, PathBuf::from("/data"));
+        assert!(config.server.allowed_hosts.is_empty());
+        assert_eq!(config.server.bind_addr(None).unwrap(), "0.0.0.0:8080");
+        assert_eq!(config.server.bind_addr(Some("1234")).unwrap(), "0.0.0.0:1234");
+        assert_eq!(
+            config.server.effective_allowed_hosts(Some("keyshare.up.railway.app")),
+            vec!["keyshare.up.railway.app".to_string()]
+        );
+        assert!(config.hyperliquid.is_none());
+        assert_eq!(config.chains[0].id, 11155111);
+        let bot = config.bots.get("filltape").unwrap();
+        assert_eq!(bot.credential_sha256, B256::ZERO);
+        assert_eq!(bot.key_env, "FILLTAPE_KEY");
+        assert_eq!(bot.policy.chains, vec![11155111]);
+        let hl = bot.hyperliquid.as_ref().unwrap();
+        assert_eq!(hl.markets, vec!["ETH".to_string(), "BTC".to_string()]);
     }
 }

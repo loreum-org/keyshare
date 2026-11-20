@@ -13,7 +13,7 @@ alloy = { workspace = true, features = ["provider-http", "reqwest-rustls-tls", "
 axum = "0.8"
 http = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
-rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.11", features = ["server", "macros", "transport-streamable-http-server"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"

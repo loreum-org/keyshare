@@ -8,8 +8,8 @@ Secrets never go in this file. Bot keys come from environment variables, and bot
 
 | Setting | Required | Meaning |
 |---|---|---|
-| `listen` | yes | Address and port to listen on, e.g. `"127.0.0.1:8080"`. |
-| `allowed_hosts` | no | Host headers to accept. Empty (the default) accepts only `localhost`, `127.0.0.1` and `::1`. List your public domain here when deployed. |
+| `listen` | yes | Address and port to listen on, e.g. `"127.0.0.1:8080"`. If the `PORT` environment variable is set, the server listens on `0.0.0.0:$PORT` instead. |
+| `allowed_hosts` | no | Host headers to accept. Empty (the default) accepts only `localhost`, `127.0.0.1` and `::1`. Hosts in `KEYSHARE_ALLOWED_HOSTS` (comma-separated, no scheme) are merged in at startup. The DNS-rebinding guard stays on. |
 | `state_dir` | yes | Folder for the spend log, audit log, kill switch file and Hyperliquid agent keys. |
 | `spend_anchor` | no | Where to keep a copy of the spend log's latest entry. Default is inside `state_dir`. Put it on another disk. See [Safety and state](safety.md). |
 | `admin_token_sha256` | no | Hash of the token for `GET /admin/pending` (make one with `keyshare-mcp new-token`). Without it, the pending list is off. |

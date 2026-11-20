@@ -1,0 +1,9 @@
+.git
+.github
+target
+state
+.env
+.env.*
+*.pem
+*.key
+keyshare.toml
