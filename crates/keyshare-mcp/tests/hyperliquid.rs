@@ -28,6 +28,18 @@ const PLAIN_KEY: &str = "0x8da4ef21b864d2cc526dbdb2a120bd2874c36c9d0a1fb7f8c63d7
 struct Venue {
     account_value: String,
     eth_szi: String,
+    /// ETH unrealized PnL. `None` omits the field.
+    eth_pnl: Option<String>,
+    /// Perp `withdrawable`. `None` omits the field.
+    withdrawable: Option<String>,
+    /// Include `assetPositions`. A missing array is a failed read.
+    include_positions: bool,
+    /// `userAbstraction` response. A JSON string such as `"default"`.
+    abstraction: Value,
+    /// `spotClearinghouseState` response.
+    spot: Value,
+    /// Info request types, in order.
+    seen: Vec<String>,
     /// ETH mark price; BTC is fixed at 60,000.
     eth_mark: String,
     /// Current ETH and BTC leverage on the account.
@@ -42,17 +54,37 @@ async fn mock_hl(venue: Arc<Mutex<Venue>>) -> String {
         move |Json(req): Json<Value>| {
             let venue = venue.clone();
             async move {
-                let v = venue.lock().unwrap();
-                Json(match req["type"].as_str().unwrap() {
+                let mut v = venue.lock().unwrap();
+                let kind = req["type"].as_str().unwrap().to_string();
+                v.seen.push(kind.clone());
+                Json(match kind.as_str() {
                     "meta" => json!({"universe": [
                         {"name": "BTC", "szDecimals": 5},
                         {"name": "ETH", "szDecimals": 4},
                         {"name": "SOL", "szDecimals": 2}
                     ]}),
-                    "clearinghouseState" => json!({
-                        "marginSummary": {"accountValue": v.account_value},
-                        "assetPositions": [{"position": {"coin": "ETH", "szi": v.eth_szi}}]
-                    }),
+                    "clearinghouseState" => {
+                        let mut position = json!({"coin": "ETH", "szi": v.eth_szi});
+                        if let Some(pnl) = &v.eth_pnl {
+                            position["unrealizedPnl"] = json!(pnl);
+                        }
+                        let mut state = json!({
+                            "marginSummary": {"accountValue": v.account_value},
+                            "crossMarginSummary": {"accountValue": v.account_value},
+                            "withdrawable": "0.0",
+                        });
+                        if v.include_positions {
+                            state["assetPositions"] = json!([{"position": position}]);
+                        }
+                        if let Some(w) = &v.withdrawable {
+                            state["withdrawable"] = json!(w);
+                        } else {
+                            state.as_object_mut().unwrap().remove("withdrawable");
+                        }
+                        state
+                    }
+                    "userAbstraction" => v.abstraction.clone(),
+                    "spotClearinghouseState" => v.spot.clone(),
                     "metaAndAssetCtxs" => json!([
                         {"universe": [{"name": "BTC"}, {"name": "ETH"}, {"name": "SOL"}]},
                         [{"markPx": "60000.0"}, {"markPx": v.eth_mark, "oraclePx": "1.0"}, {"oraclePx": "150.0"}]
@@ -94,6 +126,8 @@ async fn fixture() -> Fixture {
     let venue = Arc::new(Mutex::new(Venue {
         account_value: "10000.0".into(),
         eth_szi: "0.0".into(),
+        include_positions: true,
+        abstraction: json!("default"),
         eth_mark: "2500.0".into(),
         leverage: 3,
         ..Default::default()
@@ -269,6 +303,10 @@ async fn approved_agent_signs_orders_within_guardrails() {
 
     let r = call(&f.app, "hl_positions", json!({})).await;
     assert_eq!(r["structuredContent"]["state"]["marginSummary"]["accountValue"], "10000.0");
+    assert_eq!(r["structuredContent"]["account"]["equity"], "10000.0");
+    assert_eq!(r["structuredContent"]["account"]["abstraction"], "default");
+    assert_eq!(r["structuredContent"]["account"]["equity_source"], "perp_account_value");
+    assert!(r["structuredContent"]["account"].get("available_margin").is_none());
 
     // A request id is spent once the agent signs, so a retry cannot place a second order.
     let mut once = buy("0.1", "2500");
@@ -349,6 +387,176 @@ async fn daily_loss_stop_allows_only_reduce_only() {
     assert_eq!(call(&f.app, "hl_place_order", close.clone()).await["isError"], false);
     close["coin"] = json!("SOL");
     assert_eq!(code(&call(&f.app, "hl_place_order", close).await), "MARKET_NOT_ALLOWED");
+}
+
+fn today() -> u64 {
+    keyshare_mcp::hl::now_ms() / 86_400_000
+}
+
+fn day_file(f: &Fixture) -> std::path::PathBuf {
+    f.config.server.state_dir.join("hyperliquid/filltape.day.json")
+}
+
+fn write_day(f: &Fixture, value: &str) {
+    let path = day_file(f);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, json!({"day": today(), "account_value": value}).to_string()).unwrap();
+}
+
+fn saved_day(f: &Fixture) -> Value {
+    serde_json::from_slice(&std::fs::read(day_file(f)).unwrap()).unwrap()
+}
+
+/// Spot USDC only. Perp account value stays 0, which is what a unified account reports.
+fn unified(v: &mut Venue, total: &str, hold: &str, available: &str) {
+    v.abstraction = json!("unifiedAccount");
+    v.account_value = "0.0".into();
+    v.eth_szi = "0.0".into();
+    v.eth_pnl = None;
+    v.spot = json!({
+        "balances": [{"coin": "USDC", "token": 0, "total": total, "hold": hold, "entryNtl": "0.0"}],
+        "tokenToAvailableAfterMaintenance": [[0, available]],
+    });
+}
+
+#[tokio::test]
+async fn standard_account_does_not_treat_zero_equity_as_a_stop() {
+    let f = fixture().await;
+    approve(&f).await;
+    // The old claim was that new risk is refused at zero equity. It is not:
+    // size caps still apply, and a zero baseline makes the loss today zero.
+    f.venue.lock().unwrap().account_value = "0".into();
+    assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_day(&f)["account_value"], "0");
+    assert_eq!(saved_day(&f)["basis"], "perp_account_value");
+    // A later deposit does not rewrite that real zero, and it does not trip the stop.
+    f.venue.lock().unwrap().account_value = "10000.0".into();
+    assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_day(&f)["account_value"], "0");
+    // Spot USDC on a standard account is not equity, and the spot endpoint is not read.
+    {
+        let mut v = f.venue.lock().unwrap();
+        v.seen.clear();
+        v.withdrawable = Some("8000".into());
+        v.spot = json!({
+            "balances": [{"coin": "USDC", "token": 0, "total": "999.0", "hold": "0.0", "entryNtl": "0.0"}],
+            "tokenToAvailableAfterMaintenance": [[0, "999.0"]],
+        });
+    }
+    let r = call(&f.app, "hl_positions", json!({})).await;
+    assert_eq!(r["structuredContent"]["account"]["equity"], "10000.0");
+    assert_eq!(r["structuredContent"]["account"]["available_margin"], "8000");
+    assert_eq!(r["structuredContent"]["account"]["available_source"], "withdrawable");
+    let seen = f.venue.lock().unwrap().seen.clone();
+    assert!(seen.iter().any(|t| t == "userAbstraction"));
+    assert!(seen.iter().all(|t| t != "spotClearinghouseState"), "{seen:?}");
+}
+
+#[tokio::test]
+async fn unified_usdc_equity_and_loss_baseline() {
+    let f = fixture().await;
+    approve(&f).await;
+    // A previous read stored the meaningless perp zero. The account is flat, so that
+    // baseline is replaced with the USDC balance and is not left to mask later losses.
+    write_day(&f, "0");
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+    }
+    let r = call(&f.app, "hl_positions", json!({})).await;
+    assert_eq!(r["isError"], false, "{r}");
+    let account = &r["structuredContent"]["account"];
+    assert_eq!(account["abstraction"], "unifiedAccount");
+    assert_eq!(account["equity"], "999.0");
+    assert_eq!(account["usdc_total"], "999.0");
+    assert_eq!(account["unrealized_pnl"], "0");
+    assert_eq!(account["available_margin"], "999.0");
+    assert_eq!(account["available_source"], "token_to_available_after_maintenance");
+    assert_eq!(r["structuredContent"]["state"]["marginSummary"]["accountValue"], "0.0");
+    assert_eq!(saved_day(&f)["account_value"], "999");
+    assert_eq!(saved_day(&f)["basis"], "spot_usdc_total_plus_unrealized_pnl");
+
+    // A hold is not a loss, and it is not subtracted from the baseline by hand.
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "100.0", "850.0");
+    }
+    assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_day(&f)["account_value"], "999");
+
+    // Unrealized PnL counts once. The perp account value echoes it and is not added again.
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.account_value = "-100.01".into();
+        v.eth_szi = "0.1".into();
+        v.eth_pnl = Some("-100.01".into());
+    }
+    assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "DAILY_LOSS_STOP");
+    assert_eq!(saved_day(&f)["account_value"], "999");
+    let close = json!({"coin": "ETH", "is_buy": false, "sz": "0.1", "limit_px": "2400", "reduce_only": true});
+    assert_eq!(call(&f.app, "hl_place_order", close).await["isError"], false);
+
+    // A non-zero saved baseline is not replaced, even when it is above today's equity.
+    write_day(&f, "5000");
+    let before = std::fs::read(day_file(&f)).unwrap();
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+    }
+    assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "DAILY_LOSS_STOP");
+    assert_eq!(std::fs::read(day_file(&f)).unwrap(), before);
+}
+
+#[tokio::test]
+async fn unified_failures_refuse_new_risk_and_keep_reduce_only() {
+    let f = fixture().await;
+    approve(&f).await;
+    let close = json!({"coin": "ETH", "is_buy": false, "sz": "0.1", "limit_px": "2400", "reduce_only": true});
+
+    // Portfolio margin is not priced. The order is refused and no baseline is invented.
+    f.venue.lock().unwrap().abstraction = json!("portfolioMargin");
+    assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "VENUE_UNAVAILABLE");
+    assert_eq!(call(&f.app, "hl_place_order", close.clone()).await["isError"], false);
+    assert!(!day_file(&f).exists());
+
+    // Non-USDC collateral, a missing available figure, and a non-flat legacy zero.
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.spot["balances"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"coin": "PURR", "token": 1, "total": "2", "hold": "0.0"}));
+    }
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "VENUE_UNAVAILABLE");
+    assert!(r["structuredContent"]["reason"].as_str().unwrap().contains("non-USDC"), "{r}");
+    assert!(!day_file(&f).exists());
+    assert_eq!(call(&f.app, "hl_place_order", close.clone()).await["isError"], false);
+
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.spot.as_object_mut().unwrap().remove("tokenToAvailableAfterMaintenance");
+    }
+    assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "VENUE_UNAVAILABLE");
+    assert_eq!(call(&f.app, "hl_positions", json!({})).await["isError"], true);
+
+    write_day(&f, "0");
+    let before = std::fs::read(day_file(&f)).unwrap();
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.eth_szi = "0.2".into();
+        v.eth_pnl = Some("-1".into());
+    }
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "VENUE_UNAVAILABLE");
+    assert!(r["structuredContent"]["reason"].as_str().unwrap().contains("untrusted zero"), "{r}");
+    assert_eq!(std::fs::read(day_file(&f)).unwrap(), before);
+    assert_eq!(call(&f.app, "hl_place_order", close).await["isError"], false);
+    assert_eq!(std::fs::read(day_file(&f)).unwrap(), before);
 }
 
 #[tokio::test]
