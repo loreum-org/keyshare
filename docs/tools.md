@@ -45,7 +45,7 @@ Only for bots with a `hyperliquid` section in the config. See [Hyperliquid](hype
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `hl_positions` | none | Positions, margin and open orders. |
+| `hl_positions` | none | Positions, margin and open orders. `account.equity` is the figure the daily loss stop uses; `account.available_margin` is free margin when the venue reports it. |
 | `hl_place_order` | `order` | Places a limit order, or a take-profit / stop-loss trigger order. |
 | `hl_modify` | `oid`, `order` | Replaces a resting order. The new order is checked like a new one. |
 | `hl_cancel` | `coin`, `oid` | Cancels a resting order. |

@@ -29,9 +29,23 @@ Set per bot in `[bots.<name>.hyperliquid]`. Without that section the bot can't u
 | `max_order_usd` | Size × price must be under this. The price used is the higher of the order's limit price and the current mark price, so a far-off limit price can't hide a large order. |
 | `max_position_usd` | The position after this order fills, plus the bot's other open orders on the same side, must stay under this. |
 | `max_leverage` | `hl_set_leverage` can't go above it, and a new order is refused if the coin's current leverage is above it. |
-| `daily_loss_stop_usd` | Keyshare records the account value the first time it checks the account each UTC day. Once the account is down this much from there, new orders that add risk are refused. |
+| `daily_loss_stop_usd` | Keyshare records equity the first time it checks the account each UTC day. Once the account is down this much from there, new orders that add risk are refused. |
 
 **Reduce-only orders skip the size, position, leverage and loss checks.** They can only shrink a position, and Hyperliquid enforces that, so a bot can always close out even after hitting a limit or if the account check fails.
+
+## Unified accounts
+
+`userAbstraction` decides which balance is equity. A missing or unknown mode fails closed for new risk. Keyshare does not change the mode.
+
+| Mode | Equity the loss stop records | Available margin |
+|---|---|---|
+| `default`, `disabled`, `dexAbstraction` | Perp `marginSummary.accountValue` (already includes unrealized PnL). Spot balances are not added. | Perp `withdrawable`, when that field is present. |
+| `unifiedAccount` | Spot USDC (token 0) `total`, plus unrealized PnL on the default perp dex. Perp `accountValue` is not added. | `tokenToAvailableAfterMaintenance` for token 0. |
+| `portfolioMargin` | Not computed. Other collateral is not priced, so new risk is refused. | |
+
+On a unified account the spot clearinghouse is the balance. USDC `total` is cash, not a sum of every spot token. A non-zero non-USDC balance or hold, a missing USDC row, a missing or unreadable available-margin entry, an available figure above the USDC balance, or a position whose unrealized PnL is missing all refuse new risk instead of counting as zero. `hl_positions` reports this under `account`: `abstraction`, `equity`, `equity_source`, `usdc_total`, `unrealized_pnl`, `available_margin`, `available_source`. The last two are omitted for a standard account when `withdrawable` is absent.
+
+A same-day baseline of exactly 0 with no `basis` is the old perp reading. It is replaced with unified equity only when that account is flat: no position size and no USDC hold. An open position or a hold leaves the zero in place and refuses new risk. Any other saved baseline is left as it is, including a real zero on a standard account and a non-zero figure.
 
 `hl_modify` checks the replacement order like a new one. `hl_cancel` only needs the coin to be allowed.
 

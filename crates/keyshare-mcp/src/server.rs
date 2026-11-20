@@ -492,7 +492,9 @@ impl KeyshareServer {
         .await
     }
 
-    #[tool(description = "Hyperliquid testnet: positions, margin and open orders of this bot's account.")]
+    #[tool(
+        description = "Hyperliquid testnet: positions, margin and open orders of this bot's account. account.equity is the figure the daily loss stop uses."
+    )]
     async fn hl_positions(
         &self,
         Extension(parts): Extension<http::request::Parts>,
