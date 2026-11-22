@@ -260,6 +260,35 @@ impl KeyshareServer {
     }
 
     #[tool(
+        description = "The owner-signed policy in force: version, content hash, who signed it, and this bot's rules in plain words. Every signature and refusal in the audit log names this version and hash."
+    )]
+    async fn policy(&self, Extension(parts): Extension<http::request::Parts>) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let Some(active) = self.exec.active_policy() else {
+            return Ok(refused("", Refusal::new(RefusalCode::Internal, "no signed policy is loaded")));
+        };
+        let c = caller.clone();
+        let limits = match self.with_wallet(move |w| w.limits(&c)).await? {
+            Ok(l) => l,
+            Err(r) => return Ok(refused("", r)),
+        };
+        let rules = active.set.bots.get(&caller);
+        let hl = rules.and_then(|r| r.hyperliquid.clone());
+        let modules = rules.map(|r| r.modules.clone()).unwrap_or_default();
+        let summary = crate::policy::summary(&active, &limits, hl.as_ref(), &modules);
+        Ok(CallToolResult::structured(json!({
+            "version": active.reference.version,
+            "hash": active.reference.hash,
+            "signed_by": active.signer,
+            "loaded_at": active.loaded_at,
+            "core": limits,
+            "hyperliquid": hl,
+            "modules": modules,
+            "summary": summary,
+        })))
+    }
+
+    #[tool(
         description = "This bot's caps and how much of today's cap it has used. When Hyperliquid is enabled, also the equity floor: floor, peak equity, current equity, headroom and whether a breach is latched. Use it to self-limit."
     )]
     async fn limits(&self, Extension(parts): Extension<http::request::Parts>) -> Result<CallToolResult, ErrorData> {
@@ -313,7 +342,7 @@ impl KeyshareServer {
             let mut tokens: Vec<(Option<Address>, u8)> = vec![(None, 18)];
             tokens.extend(
                 self.exec
-                    .tokens
+                    .tokens()
                     .iter()
                     .filter(|t| t.chain_id == chain_id && t.token.is_some())
                     .map(|t| (t.token, t.decimals)),

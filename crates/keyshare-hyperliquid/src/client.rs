@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol as hl;
@@ -488,7 +488,8 @@ pub struct Hyperliquid {
     api_url: String,
     http: reqwest::Client,
     state_dir: PathBuf,
-    policies: HashMap<String, HlPolicy>,
+    /// Replaced as a whole when the owner loads a newly signed policy.
+    policies: RwLock<HashMap<String, HlPolicy>>,
     /// Nonces are millisecond timestamps, unique per agent (design §8).
     last_nonce: Mutex<u64>,
     /// Serializes read-modify-write of the equity-floor file. Not held across awaits.
@@ -506,7 +507,7 @@ impl Hyperliquid {
             api_url: api_url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             state_dir,
-            policies,
+            policies: RwLock::new(policies),
             last_nonce: Mutex::new(0),
             equity_lock: Mutex::new(()),
             used_requests: Mutex::new(HashSet::new()),
@@ -525,9 +526,18 @@ impl Hyperliquid {
         used.remove(key);
     }
 
-    pub fn policy(&self, bot: &str) -> Result<&HlPolicy, Refusal> {
+    /// Swaps in the Hyperliquid sections of a newly signed policy.
+    pub fn set_policies(&self, policies: HashMap<String, HlPolicy>) {
+        *self.policies.write().unwrap_or_else(|e| e.into_inner()) = policies;
+    }
+
+    /// A copy of this bot's limits as of now. A reload after this call does not change the copy.
+    pub fn policy(&self, bot: &str) -> Result<HlPolicy, Refusal> {
         self.policies
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(bot)
+            .cloned()
             .ok_or_else(|| Refusal::new(RefusalCode::MarketNotAllowed, "Hyperliquid is not enabled for this bot"))
     }
 
@@ -726,7 +736,7 @@ impl Hyperliquid {
     /// latch once; if equity is still through the floor the same read latches it again.
     /// The mark is not lowered. This does not place an order.
     fn observe_floor(&self, bot: &str, eq: &Equity) -> Result<FloorView, Refusal> {
-        let policy = self.policy(bot)?.clone();
+        let policy = self.policy(bot)?;
         if !policy.equity_floor_enabled() {
             return Ok(FloorView::off(&policy));
         }
@@ -773,7 +783,7 @@ impl Hyperliquid {
     /// Floor block for the `limits` tool. `None` when this bot has no Hyperliquid policy.
     /// A failed equity read is reported, not treated as zero, and does not fail the rest of `limits`.
     pub async fn floor_for_limits(&self, exec: &impl HlHost, bot: &str) -> Option<Value> {
-        let policy = self.policies.get(bot)?.clone();
+        let policy = self.policy(bot).ok()?;
         if !policy.equity_floor_enabled() {
             return Some(FloorView::off(&policy).limits_json());
         }

@@ -9,6 +9,7 @@ pub mod audit;
 pub mod chainlog;
 pub mod killswitch;
 pub mod policy;
+pub mod policy_file;
 pub mod price;
 pub mod refusal;
 pub mod signer;

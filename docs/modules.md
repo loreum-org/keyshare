@@ -43,7 +43,7 @@ For typed data, `authorize_typed` refuses fund-moving types (permits, `Hyperliqu
 
 ## Enabling a module per bot
 
-Every module is offered unless the bot turns it off. That keeps existing configs working: the tools stay listed, and a bot with no `[bots.<name>.hyperliquid]` table still gets `MARKET_NOT_ALLOWED` when it tries to trade.
+Every module is offered unless the bot's policy turns it off. The tools stay listed, and a bot with no `[bots.<name>.hyperliquid]` section in the policy still gets `MARKET_NOT_ALLOWED` when it tries to trade.
 
 ```toml
 [bots.filltape.modules]

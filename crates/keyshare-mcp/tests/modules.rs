@@ -3,14 +3,13 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use http::Request;
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
-use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -44,15 +43,11 @@ async fn app() -> Router {
         state = dir.path().join("state").display(),
         hash = token_hash(TOKEN),
     );
-    let path = dir.path().join("keyshare.toml");
-    std::fs::write(&path, toml).unwrap();
+    let path = keyshare_mcp::policy::testing::write_signed(dir.path(), &toml);
     let config = Config::load(&path).unwrap();
     let env: HashMap<&str, &str> = [("QUIET_KEY", KEY)].into();
-    let wallet = Arc::new(Mutex::new(config.wallet(|v| env.get(v).map(|s| (*s).to_string())).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
-    let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
-    let modules = config.bots.iter().map(|(bot, cfg)| (bot.clone(), cfg.modules.clone())).collect();
-    let exec = Executor::new(wallet, chains, Arc::new(vec![]), DEFAULT_HOLD_SECS).with_modules(modules);
+    let exec = keyshare_mcp::build(&config, |v| env.get(v).map(|s| (*s).to_string())).await.unwrap();
     // Leak the temp dir for the process: the app keeps paths into it.
     std::mem::forget(dir);
     keyshare_mcp::app(Arc::new(exec), creds, None, &[])

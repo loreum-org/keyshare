@@ -29,6 +29,17 @@ if [ -n "${HL_AGENT_JSON:-}" ]; then
   unset HL_AGENT_JSON
 fi
 
+# The signed policy can come from variables too. Written to the volume, where the
+# Railway config reads it; a later file on the volume replaces it until the next start.
+if [ -n "${KEYSHARE_POLICY:-}" ]; then
+  printf '%s\n' "$KEYSHARE_POLICY" > /data/policy.toml.tmp
+  mv -f /data/policy.toml.tmp /data/policy.toml
+  if [ -n "${KEYSHARE_POLICY_SIG:-}" ]; then
+    printf '%s\n' "$KEYSHARE_POLICY_SIG" > /data/policy.toml.sig.tmp
+    mv -f /data/policy.toml.sig.tmp /data/policy.toml.sig
+  fi
+fi
+
 if [ -n "${KEYSHARE_TOML:-}" ]; then
   printf '%s\n' "$KEYSHARE_TOML" > /tmp/keyshare.toml
   exec keyshare-mcp serve /tmp/keyshare.toml

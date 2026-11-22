@@ -3,7 +3,7 @@
 //! admin approval instead (§13.2). Shared by the MCP tools and the admin endpoints.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::TxEip1559;
@@ -18,8 +18,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
-use crate::config::ModuleToggles;
+use crate::config::Config;
 use crate::hl::Hyperliquid;
+use crate::policy::{self, LoadedPolicy, ModuleToggles};
+use keyshare_core::PlainPolicy;
+use keyshare_core::policy::PolicyEngine;
+use keyshare_core::policy_file::{PolicyRef, VersionGate};
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
 pub const DEFAULT_HOLD_SECS: u64 = 15 * 60;
@@ -75,16 +79,39 @@ struct Request {
 pub struct Executor {
     wallet: Arc<Mutex<Wallet>>,
     pub chains: Arc<Chains>,
-    pub tokens: Arc<Vec<PriceEntry>>,
+    /// Priced tokens, for `balances`. Replaced with the policy's price list on reload.
+    tokens: RwLock<Arc<Vec<PriceEntry>>>,
     pub hl: Option<Arc<Hyperliquid>>,
     /// Per-bot module switches. A bot with no entry is offered every module.
-    pub modules: HashMap<String, ModuleToggles>,
+    modules: RwLock<HashMap<String, ModuleToggles>>,
+    /// The signed policy in force.
+    active: RwLock<Option<ActivePolicy>>,
+    /// Last rejected policy (hash and reason), so a bad file is logged once, not every poll.
+    last_rejected: Mutex<Option<String>>,
     /// Held from nonce lookup to broadcast so two sends never get the same nonce.
     send_lock: tokio::sync::Mutex<()>,
     /// Keyed by the caller-scoped request id. In memory: a restart drops held requests, which
     /// then never sign.
     requests: Mutex<HashMap<String, Request>>,
     hold_secs: u64,
+}
+
+/// The signed policy in force, as the `policy` tool reports it.
+#[derive(Debug, Clone)]
+pub struct ActivePolicy {
+    pub reference: PolicyRef,
+    pub signer: Address,
+    pub loaded_at: u64,
+    pub set: Arc<policy::PolicySet>,
+}
+
+/// What a reload attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reload {
+    Unchanged,
+    Loaded(PolicyRef),
+    /// The file was refused; the previous policy stays in force.
+    Rejected(String),
 }
 
 /// Held requests one bot may have waiting for the owner at once.
@@ -114,9 +141,11 @@ impl Executor {
         Self {
             wallet,
             chains,
-            tokens,
+            tokens: RwLock::new(tokens),
             hl: None,
-            modules: HashMap::new(),
+            modules: RwLock::new(HashMap::new()),
+            active: RwLock::new(None),
+            last_rejected: Mutex::new(None),
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
@@ -128,14 +157,99 @@ impl Executor {
         self
     }
 
-    pub fn with_modules(mut self, modules: HashMap<String, ModuleToggles>) -> Self {
-        self.modules = modules;
+    pub fn with_modules(self, modules: HashMap<String, ModuleToggles>) -> Self {
+        *self.modules.write().unwrap_or_else(|e| e.into_inner()) = modules;
         self
+    }
+
+    pub fn wallet(&self) -> Arc<Mutex<Wallet>> {
+        self.wallet.clone()
+    }
+
+    pub fn tokens(&self) -> Arc<Vec<PriceEntry>> {
+        self.tokens.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn modules_for(&self, bot: &str) -> Option<ModuleToggles> {
+        self.modules.read().unwrap_or_else(|e| e.into_inner()).get(bot).cloned()
+    }
+
+    pub fn active_policy(&self) -> Option<ActivePolicy> {
+        self.active.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Puts a signed policy in force: version check, then the wallet's core rules and prices,
+    /// the Hyperliquid limits, the module switches and the token list, then the version record.
+    /// Refuses an older version, or the same version with other contents.
+    pub async fn apply_policy(&self, loaded: LoadedPolicy, gate: &VersionGate) -> Result<PolicyRef, String> {
+        gate.check(&loaded.reference).map_err(|e| e.to_string())?;
+        let set = Arc::new(loaded.set);
+        let hl_policies = set.hyperliquid()?;
+        let reference = loaded.reference;
+        let signer = loaded.signer;
+        let for_wallet = set.clone();
+        self.with_wallet(move |w| {
+            let mut engines: HashMap<String, Box<dyn PolicyEngine>> = HashMap::new();
+            for (bot, rules) in &for_wallet.bots {
+                let own = w.address(bot).ok();
+                engines.insert(bot.clone(), Box::new(PlainPolicy { own_address: own, ..rules.core.clone() }));
+            }
+            let prices = for_wallet.price_table()?;
+            let detail = json!({ "version": reference.version, "hash": reference.hash, "signed_by": signer });
+            w.apply_policy(reference, engines, Box::new(prices), detail, now())
+        })
+        .await??;
+        if let Some(hl) = &self.hl {
+            hl.set_policies(hl_policies);
+        }
+        *self.modules.write().unwrap_or_else(|e| e.into_inner()) = set.modules();
+        *self.tokens.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set.prices.clone());
+        gate.record(&reference).map_err(|e| e.to_string())?;
+        *self.active.write().unwrap_or_else(|e| e.into_inner()) =
+            Some(ActivePolicy { reference, signer, loaded_at: now(), set });
+        *self.last_rejected.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(reference)
+    }
+
+    /// Looks at the policy file and loads it if its contents changed. A refused file is logged to
+    /// the audit log once and the policy in force stays.
+    pub async fn reload_policy(&self, config: &Config) -> Reload {
+        let current = self.active_policy().map(|a| a.reference.hash);
+        let on_disk = policy::read_doc(&config.server.policy).map(|d| d.reference.hash);
+        if let (Some(cur), Ok(disk)) = (current, &on_disk)
+            && cur == *disk
+        {
+            return Reload::Unchanged;
+        }
+        let result = match policy::load(config) {
+            Ok(loaded) => self.apply_policy(loaded, &VersionGate::new(config.policy_state_path())).await,
+            Err(e) => Err(e.to_string()),
+        };
+        match result {
+            Ok(reference) => Reload::Loaded(reference),
+            Err(reason) => {
+                let key = format!("{:?}|{reason}", on_disk.as_ref().ok());
+                let first_time = {
+                    let mut last = self.last_rejected.lock().unwrap_or_else(|e| e.into_inner());
+                    let new = last.as_deref() != Some(key.as_str());
+                    *last = Some(key);
+                    new
+                };
+                if first_time {
+                    let hash = on_disk.ok();
+                    let detail = json!({ "hash": hash, "reason": reason });
+                    let _ = self
+                        .with_wallet(move |w| w.log_event("", "policy", AuditEvent::PolicyRejected, detail, now()))
+                        .await;
+                }
+                Reload::Rejected(reason)
+            }
+        }
     }
 
     /// Tool names this bot should not see. An unknown bot, or a bot with no switches, hides nothing.
     pub fn hidden_tools(&self, bot: &str) -> Vec<&'static str> {
-        let Some(toggles) = self.modules.get(bot) else { return Vec::new() };
+        let Some(toggles) = self.modules_for(bot) else { return Vec::new() };
         let mut hidden = Vec::new();
         if !toggles.hyperliquid {
             hidden.extend(keyshare_hyperliquid::client::HYPERLIQUID_TOOLS);

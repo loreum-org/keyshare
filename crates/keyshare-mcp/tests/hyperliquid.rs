@@ -14,7 +14,6 @@ use keyshare_core::killswitch::KillSwitch;
 use keyshare_hyperliquid::protocol as hl;
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
-use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
 use keyshare_signer::LocalSigner;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -160,17 +159,13 @@ fn write_config(dir: &std::path::Path, state: &std::path::Path, api: &str, hl_ex
         hash = token_hash(TOKEN),
         plain_hash = token_hash(PLAIN_TOKEN),
     );
-    let path = dir.join("keyshare.toml");
-    std::fs::write(&path, toml).unwrap();
+    let path = keyshare_mcp::policy::testing::write_signed(dir, &toml);
     Config::load(&path).unwrap()
 }
 
-fn serve(config: &Config) -> Router {
-    let wallet = Arc::new(Mutex::new(config.wallet(env).unwrap()));
+async fn serve(config: &Config) -> Router {
     let creds: Credentials = Arc::new(config.credentials().unwrap());
-    let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
-    let exec = Executor::new(wallet, chains, Arc::new(vec![]), DEFAULT_HOLD_SECS)
-        .with_hyperliquid(config.hyperliquid().unwrap());
+    let exec = keyshare_mcp::build(config, env).await.unwrap();
     keyshare_mcp::app(Arc::new(exec), creds, None, &[])
 }
 
@@ -191,19 +186,20 @@ async fn fixture_with(hl_extra: &str) -> Fixture {
     let api = mock_hl(venue.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path(), &dir.path().join("state"), &api, hl_extra);
-    let app = serve(&config);
+    let app = serve(&config).await;
     Fixture { app, config, venue, _dir: dir }
 }
 
-fn restart(f: &Fixture) -> Router {
-    serve(&f.config)
+async fn restart(f: &Fixture) -> Router {
+    serve(&f.config).await
 }
 
 /// A new process: same state directory and mock, with a different floor config.
-fn reload(f: &Fixture, hl_extra: &str) -> Router {
+/// The owner signs the changed rules as the next policy version.
+async fn reload(f: &Fixture, hl_extra: &str) -> Router {
     let api = f.config.hyperliquid.as_ref().unwrap().api_url.clone().unwrap();
     let config = write_config(f._dir.path(), &f.config.server.state_dir, &api, hl_extra);
-    serve(&config)
+    serve(&config).await
 }
 
 async fn rpc(app: &Router, token: &str, session: Option<&str>, body: Value) -> (Option<String>, Value) {
@@ -691,18 +687,18 @@ async fn equity_floor_latches_until_an_explicit_reset() {
     assert!(reason(&r).contains("latched"), "{}", reason(&r));
     assert!(reason(&r).contains("equity 9500"), "{}", reason(&r));
     assert!(reason(&r).contains("floor 8000"), "{}", reason(&r));
-    let app = restart(&f);
+    let app = restart(&f).await;
     assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
 
     // Editing the floor number is not a reset.
-    let app = reload(&f, "equity_floor_usd = 1000");
+    let app = reload(&f, "equity_floor_usd = 1000").await;
     assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
     assert_eq!(saved_equity(&f)["peak"], "10000");
 
     // The reset flag clears once. The high-water mark stays where it was.
     // The day's loss baseline is pinned so the daily stop is not what allows this order.
     write_day(&f, "9500");
-    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true").await;
     assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
     assert_eq!(saved_equity(&f)["breached"], false);
     assert_eq!(saved_equity(&f)["reset_seen"], true);
@@ -712,15 +708,15 @@ async fn equity_floor_latches_until_an_explicit_reset() {
     f.venue.lock().unwrap().account_value = "7000".into();
     assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
     f.venue.lock().unwrap().account_value = "9500".into();
-    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true").await;
     assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
 
     // Toggle the flag off, then on, once equity is back above the floor.
-    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = false");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = false").await;
     assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
     assert_eq!(saved_equity(&f)["reset_seen"], false);
     write_day(&f, "9500");
-    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true").await;
     assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
     assert_eq!(saved_equity(&f)["breached"], false);
     assert_eq!(saved_equity(&f)["peak"], "10000");
@@ -772,7 +768,7 @@ async fn drawdown_peak_tracks_across_restarts() {
     assert_eq!(saved_equity(&f)["breached"], false);
 
     f.venue.lock().unwrap().account_value = "12000".into();
-    let app = restart(&f);
+    let app = restart(&f).await;
     let r = call(&app, "hl_positions", json!({})).await;
     assert_eq!(r["structuredContent"]["account"]["peak_equity"], "12000");
     assert_eq!(r["structuredContent"]["account"]["floor"], "11800");
@@ -784,13 +780,13 @@ async fn drawdown_peak_tracks_across_restarts() {
     // Pin the daily baseline so the daily loss stop is not the check under test.
     write_day(&f, "11800.01");
     f.venue.lock().unwrap().account_value = "11800.01".into();
-    let app = restart(&f);
+    let app = restart(&f).await;
     assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
     assert_eq!(saved_equity(&f)["peak"], "12000");
     assert_eq!(saved_equity(&f)["breached"], false);
 
     f.venue.lock().unwrap().account_value = "11800".into();
-    let app = restart(&f);
+    let app = restart(&f).await;
     let r = call(&app, "hl_place_order", buy("0.1", "2500")).await;
     assert_eq!(code(&r), "EQUITY_FLOOR_BREACHED");
     assert!(reason(&r).contains("equity 11800"), "{}", reason(&r));
@@ -857,5 +853,9 @@ async fn unreadable_equity_fails_closed_for_new_risk() {
 fn example_config_parses() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../keyshare.example.toml");
     let config = Config::load(&path).unwrap();
-    assert!(config.bots["filltape"].hyperliquid.is_some());
+    let doc = keyshare_mcp::policy::read_doc(&path.with_file_name("policy.example.toml")).unwrap();
+    let policy = keyshare_mcp::policy::PolicySet::from_doc(&doc).unwrap();
+    policy.check_bots(&config).unwrap();
+    assert!(policy.bots["filltape"].hyperliquid.is_some());
+    assert!(config.hyperliquid(&policy).is_ok());
 }

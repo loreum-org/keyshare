@@ -40,6 +40,8 @@ Limit: if both the log and the anchor are deleted, Keyshare starts fresh with no
 
 `audit.jsonl` records every signing request: when it arrived, the outcome (`Signed`, `Refused`, or `Held` for the owner), the bot, the request id and the details. The request is logged before it is checked, so nothing is signed without a record. It is hash-chained the same way as the spend log.
 
+Every entry also names the signed policy in force (`policy.version` and `policy.hash`), and each `Signed` or policy `Refused` entry records the 24-hour spend the check used. `keyshare-mcp policy-verify` uses that to re-check each decision against the policy file. Loading a policy logs `PolicyLoaded`; a refused policy file logs `PolicyRejected`. See [Signed policy](policy-signing.md).
+
 ## State folder
 
 | File | What it is |
@@ -48,9 +50,10 @@ Limit: if both the log and the anchor are deleted, Keyshare starts fresh with no
 | `spend.anchor.json` | Rollback anchor (unless `spend_anchor` points elsewhere). |
 | `audit.jsonl` | Audit log. |
 | `kill.json` | Kill switch. |
+| `policy.state.json` | Version and hash of the newest signed policy this server accepted. An older policy is refused. |
 | `hyperliquid/<bot>.agent.json` | Hyperliquid agent keys, readable only by the server's user. |
 | `hyperliquid/<bot>.day.json` | Equity at the first check of the UTC day, for the daily loss stop. |
-| `hyperliquid/<bot>.equity.json` | Equity-floor high-water mark and latched breach. Cleared only by `reset_equity_floor` on restart. |
+| `hyperliquid/<bot>.equity.json` | Equity-floor high-water mark and latched breach. Cleared only by `reset_equity_floor` in a newly loaded policy. |
 
 Back up the folder, but never restore it over a running wallet without understanding the rollback guard above. Only one server may use a state folder at a time.
 
@@ -73,5 +76,6 @@ Known gaps that are fine on testnet but must be closed first:
 - Allowlisted typed-data orders (for example Seaport or CoW) count as $0.
 - Finished requests stay in the server's memory until restart; there is no expiry.
 - An owner approval isn't tied to one specific hold (see [Owner approvals](owner-approvals.md)).
-- Prices are a fixed table in the config, not a live feed.
+- Prices are a fixed table in the signed policy, not a live feed.
+- Deleting `policy.state.json` lets an older signed policy load again. Keep old signed policies out of reach, or remove a compromised signer from `policy_signers`.
 - There is one key per bot, not 2-of-3 threshold signing. That is Phase 1.

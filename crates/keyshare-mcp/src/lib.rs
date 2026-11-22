@@ -7,6 +7,7 @@ pub mod chain;
 pub mod config;
 pub mod exec;
 pub mod hl;
+pub mod policy;
 pub mod server;
 pub mod swap;
 
@@ -18,8 +19,51 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
 use crate::auth::Credentials;
-use crate::exec::Executor;
+use crate::chain::Chains;
+use crate::config::Config;
+use crate::exec::{DEFAULT_HOLD_SECS, Executor, Reload};
 use crate::server::KeyshareServer;
+use keyshare_core::policy_file::VersionGate;
+
+/// Builds the executor from the config and the signed policy, and puts the policy in force.
+/// Fails if the policy is unsigned, signed by the wrong key, invalid, or older than the newest
+/// one this state directory has accepted.
+pub async fn build(config: &Config, env: impl Fn(&str) -> Option<String>) -> Result<Executor, String> {
+    let loaded = policy::load(config).map_err(|e| format!("policy {}: {e}", config.server.policy.display()))?;
+    let gate = VersionGate::new(config.policy_state_path());
+    gate.check(&loaded.reference).map_err(|e| e.to_string())?;
+    let wallet = config.wallet(env, &loaded.set).map_err(|e| e.to_string())?;
+    let chains = Arc::new(Chains::new(&config.chains).map_err(|e| e.to_string())?);
+    let tokens = Arc::new(loaded.set.prices.clone());
+    let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
+    let hl = config.hyperliquid(&loaded.set).map_err(|e| e.to_string())?;
+    let exec = Executor::new(Arc::new(std::sync::Mutex::new(wallet)), chains, tokens, hold)
+        .with_hyperliquid(hl)
+        .with_modules(loaded.set.modules());
+    exec.apply_policy(loaded, &gate).await?;
+    Ok(exec)
+}
+
+/// Polls the policy file every `server.policy_reload_secs` (default 5) and loads a newly signed
+/// version without a restart. Returns `None` when reloading is off.
+pub fn spawn_policy_reload(exec: Arc<Executor>, config: Arc<Config>) -> Option<tokio::task::JoinHandle<()>> {
+    let secs = config.server.policy_reload_secs.unwrap_or(5);
+    if secs == 0 {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match exec.reload_policy(&config).await {
+                Reload::Unchanged => {}
+                Reload::Loaded(p) => eprintln!("policy version {} loaded ({})", p.version, p.hash),
+                Reload::Rejected(why) => eprintln!("policy file refused, keeping the current policy: {why}"),
+            }
+        }
+    }))
+}
 
 /// The HTTP app: `/mcp` behind bot auth; `/admin/*` for the owner; `/health` open.
 pub fn app(
