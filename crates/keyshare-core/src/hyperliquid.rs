@@ -277,7 +277,7 @@ pub fn signature_json(sig: &Signature) -> serde_json::Value {
 // ---- guardrails ----
 
 /// Per-bot trading limits, checked by the connector before the agent key signs (design §8).
-/// Reduce-only orders skip the size caps and the loss stop: they can only shrink risk.
+/// Reduce-only orders skip the size caps, the loss stop and the equity floor: they can only shrink risk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HlPolicy {
@@ -292,7 +292,23 @@ pub struct HlPolicy {
     /// New risk stops once account value falls this far below its value at the first order of
     /// the UTC day. Deposits and withdrawals during the day move it too.
     pub daily_loss_stop_usd: u64,
+    /// Absolute equity floor in whole USD. At or below this, new risk is refused and the breach
+    /// stays latched until [`Self::reset_equity_floor`]. Unset means no absolute floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equity_floor_usd: Option<u64>,
+    /// Trailing floor in whole USD below the persisted high-water mark. Unset means no trailing floor.
+    /// The mark only moves up. It is not lowered when this breach is cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_drawdown_from_peak_usd: Option<u64>,
+    /// Set true and restart to clear a latched equity-floor breach once, on the next equity read.
+    /// Leaving it true does not clear a later breach; set it back to false in between. This does
+    /// not flatten the account and does not lower the high-water mark.
+    #[serde(default)]
+    pub reset_equity_floor: bool,
 }
+
+/// Largest absolute floor or trailing drawdown accepted at config load, in whole USD.
+pub const MAX_EQUITY_LIMIT_USD: u64 = 1_000_000_000_000;
 
 /// What the connector knows about an order when it checks it.
 pub struct OrderCheck<'a> {
@@ -314,11 +330,68 @@ fn usd_micros(whole: u64) -> UsdMicros {
     u128::from(whole) * 1_000_000
 }
 
+fn usd_e8(whole: u64) -> Result<i128, String> {
+    i128::from(whole).checked_mul(E8).ok_or_else(|| format!("{whole} USD does not fit"))
+}
+
 fn usd_str(micros: UsdMicros) -> String {
     format!("{}.{:02}", micros / 1_000_000, (micros % 1_000_000) / 10_000)
 }
 
 impl HlPolicy {
+    /// True when an absolute floor or a trailing drawdown is configured.
+    pub fn equity_floor_enabled(&self) -> bool {
+        self.equity_floor_usd.is_some() || self.max_drawdown_from_peak_usd.is_some()
+    }
+
+    /// Reject a zero or absurd floor at config load. Unset limits are valid and leave the
+    /// daily loss stop as the only equity check.
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |name: &str, value: u64| -> Result<(), String> {
+            if value == 0 {
+                return Err(format!("{name} must be a positive whole number of USD"));
+            }
+            if value > MAX_EQUITY_LIMIT_USD {
+                return Err(format!("{name} {value} is above {MAX_EQUITY_LIMIT_USD} USD"));
+            }
+            usd_e8(value)?;
+            Ok(())
+        };
+        if let Some(value) = self.equity_floor_usd {
+            check("equity_floor_usd", value)?;
+        }
+        if let Some(value) = self.max_drawdown_from_peak_usd {
+            check("max_drawdown_from_peak_usd", value)?;
+        }
+        Ok(())
+    }
+
+    /// Binding floor in `E8`: the higher of the absolute floor and `peak_e8` minus the trailing
+    /// drawdown. `None` when neither limit is set. Equity at or below this is a breach.
+    pub fn effective_floor_e8(&self, peak_e8: i128) -> Result<Option<i128>, String> {
+        let absolute = self.equity_floor_usd.map(usd_e8).transpose()?;
+        let trailing = match self.max_drawdown_from_peak_usd {
+            Some(limit) => {
+                Some(peak_e8.checked_sub(usd_e8(limit)?).ok_or_else(|| "equity floor underflow".to_string())?)
+            }
+            None => None,
+        };
+        Ok(match (absolute, trailing) {
+            (Some(absolute), Some(trailing)) => Some(absolute.max(trailing)),
+            (Some(absolute), None) => Some(absolute),
+            (None, Some(trailing)) => Some(trailing),
+            (None, None) => None,
+        })
+    }
+
+    /// `true` when equity is at or below the binding floor. A disabled floor is never live.
+    pub fn equity_floor_live(&self, equity_e8: i128, peak_e8: i128) -> Result<bool, String> {
+        Ok(match self.effective_floor_e8(peak_e8)? {
+            Some(floor) => equity_e8 <= floor,
+            None => false,
+        })
+    }
+
     pub fn check_market(&self, coin: &str) -> Result<(), Refusal> {
         if self.markets.iter().any(|m| m == coin) {
             Ok(())
@@ -546,6 +619,9 @@ mod tests {
             max_position_usd: 2_000,
             max_leverage: 5,
             daily_loss_stop_usd: 100,
+            equity_floor_usd: None,
+            max_drawdown_from_peak_usd: None,
+            reset_equity_floor: false,
         }
     }
 
@@ -590,5 +666,70 @@ mod tests {
         assert_eq!(policy().check_leverage("ETH", 5).map_err(|r| r.code), Ok(()));
         assert_eq!(policy().check_leverage("ETH", 6).map_err(|r| r.code), Err(RefusalCode::LeverageTooHigh));
         assert_eq!(policy().check_leverage("ETH", 0).map_err(|r| r.code), Err(RefusalCode::LeverageTooHigh));
+    }
+
+    const POLICY_TOML: &str = r#"
+        markets = ["ETH"]
+        max_order_usd = 1
+        max_position_usd = 1
+        max_leverage = 1
+        daily_loss_stop_usd = 1
+    "#;
+
+    #[test]
+    fn equity_floor_is_optional_and_must_be_positive() {
+        let off: HlPolicy = toml::from_str(POLICY_TOML).unwrap();
+        assert!(off.validate().is_ok());
+        assert!(!off.equity_floor_enabled());
+        assert!(!off.reset_equity_floor);
+        assert!(off.effective_floor_e8(0).unwrap().is_none());
+        assert!(!off.equity_floor_live(0, 0).unwrap());
+        assert!(!RefusalCode::EquityFloorBreached.is_owner_approvable());
+
+        let zero: HlPolicy = toml::from_str(&format!("{POLICY_TOML}\nequity_floor_usd = 0\n")).unwrap();
+        assert!(zero.validate().unwrap_err().contains("positive"));
+        let huge: HlPolicy =
+            toml::from_str(&format!("{POLICY_TOML}\nmax_drawdown_from_peak_usd = 1000000000001\n")).unwrap();
+        assert!(huge.validate().unwrap_err().contains("above"));
+        assert!(toml::from_str::<HlPolicy>(&format!("{POLICY_TOML}\nnot_a_limit = 1\n")).is_err());
+
+        let on: HlPolicy = toml::from_str(&format!(
+            "{POLICY_TOML}\nequity_floor_usd = 500\nmax_drawdown_from_peak_usd = 100\nreset_equity_floor = true\n"
+        ))
+        .unwrap();
+        assert!(on.validate().is_ok());
+        assert!(on.equity_floor_enabled());
+        assert!(on.reset_equity_floor);
+    }
+
+    #[test]
+    fn binding_floor_is_the_tighter_limit() {
+        let mut p = policy();
+        let peak = parse_e8("1000").unwrap();
+        p.equity_floor_usd = Some(800);
+        assert_eq!(p.effective_floor_e8(peak).unwrap(), Some(parse_e8("800").unwrap()));
+        assert!(p.equity_floor_live(parse_e8("800").unwrap(), peak).unwrap());
+        assert!(!p.equity_floor_live(parse_e8("800.00000001").unwrap(), peak).unwrap());
+
+        p.equity_floor_usd = None;
+        p.max_drawdown_from_peak_usd = Some(200);
+        // 1000 - 200 = 800. Drawdown of exactly 200 is a breach; one tick above is not.
+        assert_eq!(p.effective_floor_e8(peak).unwrap(), Some(parse_e8("800").unwrap()));
+        assert!(p.equity_floor_live(parse_e8("800").unwrap(), peak).unwrap());
+        assert!(!p.equity_floor_live(parse_e8("800.00000001").unwrap(), peak).unwrap());
+
+        // Both set: the higher floor binds. Absolute 900 beats a trailing floor of 800.
+        p.equity_floor_usd = Some(900);
+        assert_eq!(p.effective_floor_e8(peak).unwrap(), Some(parse_e8("900").unwrap()));
+        assert!(p.equity_floor_live(parse_e8("900").unwrap(), peak).unwrap());
+        assert!(!p.equity_floor_live(parse_e8("900.00000001").unwrap(), peak).unwrap());
+
+        // A peak below the drawdown limit reports a negative floor and does not pretend the
+        // account is already flat.
+        let low = parse_e8("50").unwrap();
+        p.equity_floor_usd = None;
+        assert_eq!(p.effective_floor_e8(low).unwrap(), Some(parse_e8("-150").unwrap()));
+        assert!(!p.equity_floor_live(0, low).unwrap());
+        assert!(p.equity_floor_live(parse_e8("-150").unwrap(), low).unwrap());
     }
 }

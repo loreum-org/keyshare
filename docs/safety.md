@@ -49,6 +49,8 @@ Limit: if both the log and the anchor are deleted, Keyshare starts fresh with no
 | `audit.jsonl` | Audit log. |
 | `kill.json` | Kill switch. |
 | `hyperliquid/<bot>.agent.json` | Hyperliquid agent keys, readable only by the server's user. |
+| `hyperliquid/<bot>.day.json` | Equity at the first check of the UTC day, for the daily loss stop. |
+| `hyperliquid/<bot>.equity.json` | Equity-floor high-water mark and latched breach. Cleared only by `reset_equity_floor` on restart. |
 
 Back up the folder, but never restore it over a running wallet without understanding the rollback guard above. Only one server may use a state folder at a time.
 
