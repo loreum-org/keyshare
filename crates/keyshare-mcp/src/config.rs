@@ -1,18 +1,19 @@
-//! Connector config: one TOML file. Secrets (bot keys) come from environment variables named in
-//! the file, never from the file itself.
+//! Connector config: one TOML file for the server, chains and bot identities. Secrets (bot keys)
+//! come from environment variables named in the file, never from the file itself. The rules each
+//! bot runs under (caps, allowlists, prices, module limits) are in a separate owner-signed policy
+//! file; see [`crate::policy`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
-use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
-use keyshare_hyperliquid::HlPolicy;
 use keyshare_signer::LocalSigner;
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
 use crate::hl::{HlConfig, Hyperliquid};
+use crate::policy::PolicySet;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,9 +22,7 @@ pub struct Config {
     /// RPC endpoint per chain. Chain tools refuse chains not listed here.
     #[serde(default)]
     pub chains: Vec<ChainConfig>,
-    #[serde(default)]
-    pub prices: Vec<PriceEntry>,
-    /// Hyperliquid API settings. Bots trade there only with a `[bots.<id>.hyperliquid]` table.
+    /// Hyperliquid API settings. Bots trade there only with a `hyperliquid` section in the policy.
     pub hyperliquid: Option<HlConfig>,
     /// Keyed by bot id.
     pub bots: HashMap<String, BotConfig>,
@@ -48,6 +47,13 @@ pub struct ServerConfig {
     pub admin_token_sha256: Option<B256>,
     /// How long a held request waits for the owner. Default 15 minutes.
     pub hold_secs: Option<u64>,
+    /// The owner-signed policy file. Its signature is read from the same path plus `.sig`.
+    pub policy: PathBuf,
+    /// Addresses allowed to sign the policy. The server refuses to start without a policy signed
+    /// by one of them.
+    pub policy_signers: Vec<Address>,
+    /// How often to look for a newly signed policy, in seconds. Default 5. 0 turns reloading off.
+    pub policy_reload_secs: Option<u64>,
 }
 
 impl ServerConfig {
@@ -100,33 +106,6 @@ pub struct BotConfig {
     /// waive are held for approval instead of refused (design §13.2).
     #[serde(default)]
     pub admin_keys: Vec<Address>,
-    pub policy: PlainPolicy,
-    /// Hyperliquid testnet guardrails. Without this table the `hl_*` tools refuse this bot.
-    pub hyperliquid: Option<HlPolicy>,
-    /// Which protocol modules this bot is offered. Omitted means every module stays available,
-    /// which is how the tools behaved before modules could be switched off.
-    #[serde(default)]
-    pub modules: ModuleToggles,
-}
-
-/// Per-bot module switches. `false` removes that module's tools from `tools/list` and rejects calls.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModuleToggles {
-    #[serde(default = "module_on")]
-    pub hyperliquid: bool,
-    #[serde(default = "module_on")]
-    pub uniswap: bool,
-}
-
-fn module_on() -> bool {
-    true
-}
-
-impl Default for ModuleToggles {
-    fn default() -> Self {
-        Self { hyperliquid: true, uniswap: true }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,10 +171,16 @@ impl Config {
         Ok(out)
     }
 
-    /// Builds the wallet, reading each bot's key with `env`.
-    pub fn wallet(&self, env: impl Fn(&str) -> Option<String>) -> Result<Wallet, ConfigError> {
+    /// Where the policy's version record lives.
+    pub fn policy_state_path(&self) -> PathBuf {
+        self.server.state_dir.join("policy.state.json")
+    }
+
+    /// Builds the wallet under `policy`, reading each bot's key with `env`.
+    pub fn wallet(&self, env: impl Fn(&str) -> Option<String>, policy: &PolicySet) -> Result<Wallet, ConfigError> {
         let mut accounts = HashMap::new();
         for (bot, cfg) in &self.bots {
+            let rules = policy.bots.get(bot).ok_or_else(|| ConfigError::Other(format!("policy has no bot {bot}")))?;
             let key = env(&cfg.key_env)
                 .ok_or_else(|| ConfigError::MissingKey { bot: bot.clone(), var: cfg.key_env.clone() })?;
             let signer = LocalSigner::from_hex(&key)
@@ -205,25 +190,20 @@ impl Config {
                 bot.clone(),
                 Account {
                     signer: Box::new(signer),
-                    policy: Box::new(PlainPolicy { own_address: Some(own), ..cfg.policy.clone() }),
+                    policy: Box::new(PlainPolicy { own_address: Some(own), ..rules.core.clone() }),
                     admins: cfg.admin_keys.clone(),
                 },
             );
         }
-        let prices = PriceTable::from_entries(&self.prices).map_err(|e| ConfigError::Other(e.to_string()))?;
+        let prices = PriceTable::from_entries(&policy.prices).map_err(|e| ConfigError::Other(e.to_string()))?;
         std::fs::create_dir_all(&self.server.state_dir)
             .map_err(|e| ConfigError::Read(self.server.state_dir.clone(), e))?;
         Wallet::open(accounts, Box::new(prices), &self.state_paths()).map_err(|e| ConfigError::Other(e.to_string()))
     }
 
-    pub fn hyperliquid(&self) -> Result<Hyperliquid, ConfigError> {
+    pub fn hyperliquid(&self, policy: &PolicySet) -> Result<Hyperliquid, ConfigError> {
         crate::hl::check_api_url(self.hyperliquid.as_ref()).map_err(ConfigError::Other)?;
-        let mut policies = HashMap::new();
-        for (bot, cfg) in &self.bots {
-            let Some(policy) = cfg.hyperliquid.clone() else { continue };
-            policy.validate().map_err(|e| ConfigError::Other(format!("bot {bot}: {e}")))?;
-            policies.insert(bot.clone(), policy);
-        }
+        let policies = policy.hyperliquid().map_err(ConfigError::Other)?;
         Ok(Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies))
     }
 }
@@ -240,6 +220,9 @@ mod tests {
             spend_anchor: None,
             admin_token_sha256: None,
             hold_secs: None,
+            policy: PathBuf::from("/data/policy.toml"),
+            policy_signers: Vec::new(),
+            policy_reload_secs: None,
         }
     }
 
@@ -277,7 +260,7 @@ mod tests {
     #[test]
     fn railway_example_is_testnet_with_runtime_hosts() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../keyshare.railway.example.toml");
-        let mut config = Config::load(&path).unwrap();
+        let config = Config::load(&path).unwrap();
         assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.server.state_dir, PathBuf::from("/data"));
         assert!(config.server.allowed_hosts.is_empty());
@@ -289,28 +272,37 @@ mod tests {
         );
         assert!(config.hyperliquid.is_none());
         assert_eq!(config.chains[0].id, 11155111);
+        assert_eq!(config.server.policy, PathBuf::from("/data/policy.toml"));
         {
             let bot = config.bots.get("filltape").unwrap();
             assert_eq!(bot.credential_sha256, B256::ZERO);
             assert_eq!(bot.key_env, "FILLTAPE_KEY");
-            assert_eq!(bot.policy.chains, vec![11155111]);
+        }
+
+        // The image ships policy.example.toml as the starting point for /data/policy.toml.
+        let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy.example.toml"));
+        let doc = keyshare_core::policy_file::PolicyDoc::parse(&text.unwrap()).unwrap();
+        let mut policy = PolicySet::from_doc(&doc).unwrap();
+        {
+            let bot = policy.bots.get("filltape").unwrap();
+            assert_eq!(bot.core.chains, vec![11155111]);
             let hl = bot.hyperliquid.as_ref().unwrap();
             assert_eq!(hl.markets, vec!["ETH".to_string(), "BTC".to_string()]);
             assert!(!hl.equity_floor_enabled());
         }
-        assert!(config.hyperliquid().is_ok());
+        assert!(config.hyperliquid(&policy).is_ok());
 
         {
-            let hl = config.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
+            let hl = policy.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
             hl.equity_floor_usd = Some(0);
         }
-        let err = config.hyperliquid().err().unwrap().to_string();
+        let err = config.hyperliquid(&policy).err().unwrap().to_string();
         assert!(err.contains("filltape") && err.contains("positive"), "{err}");
         {
-            let hl = config.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
+            let hl = policy.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
             hl.equity_floor_usd = Some(500);
             hl.max_drawdown_from_peak_usd = Some(100);
         }
-        assert!(config.hyperliquid().is_ok());
+        assert!(config.hyperliquid(&policy).is_ok());
     }
 }

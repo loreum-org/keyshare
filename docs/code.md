@@ -10,6 +10,7 @@ The signing path, with no network code and no venue logic. Everything here will 
 |---|---|
 | `wallet.rs` | The one path every signature goes through: audit, caller, kill switch, anchor check, request id, policy, record spend, sign, audit. |
 | `policy.rs` | The policy rules and checks (`PlainPolicy`). `PolicyEngine` is the trait a later proof-based check can plug into. |
+| `policy_file.rs` | Signed policy: canonical hash, the signing message, signature check against the signer list, and the version gate. |
 | `signer.rs` | The `Signer` trait. Every method takes the full payload, never a bare hash. Nothing here loads a key or builds a signer. |
 | `spend.rs` | Spend log, used request ids, rollback anchor. |
 | `chainlog.rs` | The hash-chained JSON-lines file used by the spend and audit logs. |
@@ -44,9 +45,10 @@ The server bots talk to, and the command line.
 
 | File | What it does |
 |---|---|
-| `main.rs` | Command line: `serve`, `new-token`, `freeze`, `unfreeze`, `hl-approve-agent`. |
-| `lib.rs` | Builds the HTTP app: MCP at `/mcp`, owner endpoints, host check. |
+| `main.rs` | Command line: `serve`, `new-token`, `freeze`, `unfreeze`, `hl-approve-agent`, `policy-hash`, `policy-sign`, `policy-verify`, `policy-migrate`. |
+| `lib.rs` | Builds the executor from config and signed policy, the policy reload loop, and the HTTP app: MCP at `/mcp`, owner endpoints, host check. |
 | `config.rs` | Reads and checks the TOML config. Bot keys come from environment variables. |
+| `policy.rs` | The signed policy file: loading and checking it, the `policy` tool summary, the audit verifier, and the migration from inline rules. |
 | `auth.rs` | Bearer tokens. Matches a token's hash to a bot. |
 | `server.rs` | The generic MCP tools, plus dispatch into the Hyperliquid and Uniswap modules. |
 | `exec.rs` | Runs transactions: check, simulate, sign, send. Holds requests for the owner. Implements the module host traits and re-checks intents before signing. |
@@ -55,9 +57,9 @@ The server bots talk to, and the command line.
 | `swap.rs` | Re-exports the Uniswap module. |
 | `hl.rs` | Re-exports the Hyperliquid module and the owner `hl-approve-agent` command. |
 
-Tests: `tests/connector.rs` (tools, auth, approvals, against a mock RPC), `tests/swap.rs`, `tests/hyperliquid.rs` (against a mock Hyperliquid API), `tests/modules.rs` (a bot with a module switched off is not offered that module's tools).
+Tests: `tests/connector.rs` (tools, auth, approvals, against a mock RPC), `tests/swap.rs`, `tests/hyperliquid.rs` (against a mock Hyperliquid API), `tests/modules.rs` (a bot with a module switched off is not offered that module's tools), `tests/policy.rs` (unsigned, tampered, wrongly signed and older policies refused; hot reload; the verifier).
 
-The repo root `Dockerfile` and `railway.toml` are the Railway image. It builds with Rust 1.94.1 and runs `keyshare-mcp` as user `keyshare`. `keyshare.railway.example.toml` is the config that image serves. See [Running](running.md).
+The repo root `Dockerfile` and `railway.toml` are the Railway image. It builds with Rust 1.94.1 and runs `keyshare-mcp` as user `keyshare`. `keyshare.railway.example.toml` is the config that image serves; it reads the signed policy from `/data/policy.toml`. See [Running](running.md).
 
 ## Checks
 

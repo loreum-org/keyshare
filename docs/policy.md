@@ -40,7 +40,7 @@ recipients_allow = [
   { addr = "0x2222...", chains = [11155111] },         # Sepolia only
 ]
 
-[[bots.filltape.policy.contracts_allow]]
+[[bots.filltape.core.contracts_allow]]
 addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"   # Sepolia USDC
 selectors = ["0xa9059cbb"]
 chains = [11155111]

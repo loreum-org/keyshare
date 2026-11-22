@@ -13,7 +13,7 @@ The server binary is `keyshare-mcp`.
 
 ## First setup
 
-1. **Copy the example config.** Start from `keyshare.example.toml` in the repo root. It sets up one bot, `filltape`, on Sepolia.
+1. **Copy the example config and policy.** Start from `keyshare.example.toml` and `policy.example.toml` in the repo root. They set up one bot, `filltape`, on Sepolia.
 
 2. **Make a login token for each bot.**
 
@@ -25,7 +25,14 @@ The server binary is `keyshare-mcp`.
 
 3. **Give each bot a key.** Phase 0 reads each bot's private key from an environment variable. The config names the variable with `key_env`, for example `FILLTAPE_KEY`. Keys never go in the config file. Use a fresh testnet key per bot.
 
-4. **Set the bot's rules.** Edit the bot's `policy` section: chains, caps, allowed recipients and contracts. See [Configuration](configuration.md) and [Policy](policy.md).
+4. **Set the bot's rules and sign them.** Edit the bot's section in the policy file: chains, caps, allowed recipients and contracts. See [Configuration](configuration.md) and [Policy](policy.md). Put your address in `policy_signers` in the config, then sign the policy:
+
+   ```sh
+   keyshare-mcp policy-hash policy.toml          # prints the message to sign
+   cast wallet sign "<message>" > policy.toml.sig
+   ```
+
+   See [Signed policy](policy-signing.md). Later changes get a higher `version` and a new signature; the running server picks them up within a few seconds.
 
 5. **Start the server.**
 
@@ -46,6 +53,10 @@ The server binary is `keyshare-mcp`.
 | `keyshare-mcp freeze <config> [bot]` | Turns on the kill switch for one bot, or for all bots if no bot is named. Takes effect at once on a running server. |
 | `keyshare-mcp unfreeze <config> [bot]` | Turns the kill switch off again. |
 | `keyshare-mcp hl-approve-agent <config> <bot> [hours]` | Makes a new Hyperliquid testnet agent key for a bot and has the bot's wallet approve it. Default 48 hours, at most 168. See [Hyperliquid](hyperliquid.md). |
+| `keyshare-mcp policy-hash <policy>` | Prints the policy's version, its hash, and the exact message to sign. |
+| `keyshare-mcp policy-sign <policy> <KEY_ENV>` | Signs the policy with the key in that environment variable and writes `<policy>.sig`. A testnet convenience; for a real owner key, sign the message from `policy-hash` in your own wallet. |
+| `keyshare-mcp policy-verify <policy> <audit.jsonl>` | Re-checks every decision the audit log says was made under this policy. Exits non-zero if any doesn't follow. |
+| `keyshare-mcp policy-migrate <old-config> <new-config> <policy>` | Splits a config from before signed policies (rules inline under `[bots.<name>.policy]`) into a config and an unsigned version-1 policy. |
 
 `freeze`, `unfreeze` and `hl-approve-agent` run on the same machine as the server, against the same config and state folder. `hl-approve-agent` needs the bot's key variable set, like `serve`.
 
@@ -80,8 +91,9 @@ The repo root `Dockerfile` is a multi-stage build. It compiles the workspace wit
    - `KEYSHARE_ALLOWED_HOSTS` is the Railway hostname, for example `keyshare-mcp.up.railway.app`, with no `https://`. Several hosts are comma-separated. This is merged with `allowed_hosts` from the file. The DNS-rebinding guard still rejects any other Host header on `/mcp`.
    - `PORT` is set by Railway. The process binds `0.0.0.0:$PORT`. You do not pick that port in the file for a Railway deploy. `listen = "0.0.0.0:8080"` in the example is only the fallback when `PORT` is unset.
 4. Healthcheck path: `/health`. It returns `ok`. It is not behind bot auth or the host allowlist, so Railway can call it.
-5. The process that serves is `keyshare-mcp serve <config>`, running as user `keyshare`. The image entrypoint (`/usr/local/bin/keyshare-entrypoint`) makes `/data` writable, drops to that user, then execs the serve command. Leave the Railway start command as that entrypoint. If `KEYSHARE_TOML` is set, the entrypoint writes it to a file and serves that. Otherwise it serves `/etc/keyshare/keyshare.toml` (the example baked into the image). Put a real `credential_sha256` in `KEYSHARE_TOML` or in the file you serve.
-6. Bots connect to `https://<railway-domain>/mcp` with `Authorization: Bearer <token>`. The example `credential_sha256` is a placeholder of all zeros and matches no token. Run `keyshare-mcp new-token`, put only the hash in the config the process reads, and give the token to the bot. Do not commit the token.
+5. Give the server a signed policy. The Railway config reads `/data/policy.toml` and `/data/policy.toml.sig`. Either put both files on the volume, or set `KEYSHARE_POLICY` (the policy text) and `KEYSHARE_POLICY_SIG` (the signature), which the entrypoint writes there at start. Put your address in `policy_signers` in the config you serve. A config from before signed policies won't parse: split it with `keyshare-mcp policy-migrate`, then sign the policy.
+6. The process that serves is `keyshare-mcp serve <config>`, running as user `keyshare`. The image entrypoint (`/usr/local/bin/keyshare-entrypoint`) makes `/data` writable, drops to that user, then execs the serve command. Leave the Railway start command as that entrypoint. If `KEYSHARE_TOML` is set, the entrypoint writes it to a file and serves that. Otherwise it serves `/etc/keyshare/keyshare.toml` (the example baked into the image). Put a real `credential_sha256` in `KEYSHARE_TOML` or in the file you serve.
+7. Bots connect to `https://<railway-domain>/mcp` with `Authorization: Bearer <token>`. The example `credential_sha256` is a placeholder of all zeros and matches no token. Run `keyshare-mcp new-token`, put only the hash in the config the process reads, and give the token to the bot. Do not commit the token.
 7. The filltape bot in the Railway example is Sepolia plus Hyperliquid testnet, with the same policy shape as `keyshare.example.toml`. Fund the address printed at startup with testnet tokens.
 8. One volume means `spend_anchor` sits inside `state_dir`, so startup prints the anchor warning. A second disk is optional.
 

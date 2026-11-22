@@ -21,7 +21,7 @@ To fund the account, deposit testnet USDC to the bot's wallet address on Hyperli
 
 ## Limits
 
-Set per bot in `[bots.<name>.hyperliquid]`. Without that section the bot can't use these tools.
+Set per bot in `[bots.<name>.hyperliquid]` in the signed policy file. Without that section the bot can't use these tools.
 
 | Limit | How it is checked |
 |---|---|

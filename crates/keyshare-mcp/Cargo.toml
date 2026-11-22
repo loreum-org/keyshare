@@ -22,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml.workspace = true
 
 [dev-dependencies]

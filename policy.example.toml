@@ -1,0 +1,77 @@
+# keyshare policy (Phase 0, testnet only). The owner signs this file; the server refuses to load it
+# otherwise. Raise `version` with every change: the server refuses a lower version, or the same
+# version with different contents. To roll back, sign the old rules under a new, higher version.
+#
+#   keyshare-mcp policy-hash policy.example.toml           # prints the message to sign
+#   cast wallet sign "<message>" > policy.example.toml.sig  # or: keyshare-mcp policy-sign ... OWNER_KEY
+#
+# A running server picks up a newly signed version within a few seconds, no restart needed.
+# Every audit log entry records the version and hash that were in force.
+
+version = 1
+
+# Fixed USD prices for caps (Phase 0). Tokens with no price are refused.
+[[prices]]
+chain_id = 11155111            # Sepolia ETH
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia WETH (swaps can only buy priced tokens)
+token = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+decimals = 18
+usd = "2500"
+
+[[prices]]
+chain_id = 11155111            # Sepolia USDC
+token = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+decimals = 6
+usd = "1"
+
+[bots.filltape.core]
+chains = [11155111]
+per_tx_cap_usd = 200
+daily_cap_usd = 500
+# A bare address is allowed on every chain above; tie one to chains with
+#   { addr = "0x...", chains = [11155111] }
+recipients_allow = []
+# EIP-712 payloads this bot may sign, each bound to its domain, e.g.
+#   [[bots.filltape.core.typed_data_allow]]
+#   primary_type = "Order"
+#   verifying_contract = "0x..."   # required; name = "..." alone only works with chainless
+#   chain_id = 11155111            # or chainless = true for domains without a chainId
+# Permits and Hyperliquid user-signed actions are always refused here.
+typed_data_allow = []
+max_slippage_bps = 100         # swaps accept at most 1% below the quote
+max_price_deviation_bps = 500  # swap minimum output must be within 5% of the input at the prices above
+# require_admin_cosign_above_usd = 100   # owner approves anything above this, even inside the caps
+
+[[bots.filltape.core.contracts_allow]]
+addr = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+selectors = ["0xa9059cbb", "0x095ea7b3"]   # USDC transfer, approve (exact amounts only)
+chains = [11155111]            # this address is Sepolia USDC; leave out to allow on every chain
+
+[[bots.filltape.core.contracts_allow]]
+addr = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+selectors = ["0x04e45aaf"]     # Uniswap SwapRouter02 exactInputSingle
+chains = [11155111]
+# Only exactInputSingle is checked against prices. Don't allowlist the router's other
+# selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
+
+# Hide a protocol module from this bot. Omitted means both stay available.
+# [bots.filltape.modules]
+# hyperliquid = false
+# uniswap = false
+
+# Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
+# agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
+# the size caps, the loss stop and the equity floor. Keyshare does not flatten a breached account.
+[bots.filltape.hyperliquid]
+markets = ["ETH", "BTC"]
+max_order_usd = 1000           # size x limit price
+max_position_usd = 2000        # per coin, after the order fills
+max_leverage = 5
+daily_loss_stop_usd = 100      # vs account value at the first order of the UTC day
+# equity_floor_usd = 500       # absolute floor. At or below it, only reduce risk. Unset = off.
+# max_drawdown_from_peak_usd = 200  # trailing floor, this far below the high-water mark. Unset = off.
+# reset_equity_floor = false    # set true in a newly signed version to clear a latched breach, then set it back to false in the next

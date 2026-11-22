@@ -16,6 +16,7 @@ The exception is a request that was held for the owner and then expired. Its id 
 |---|---|---|
 | `address` | none | The bot's wallet address and the chains it may use. |
 | `limits` | none | The bot's caps, how much of the rolling 24-hour cap it has used, and how many recipients, contracts and typed-data rules it has. When the bot has a Hyperliquid section, `hyperliquid` adds the equity floor: `floor`, `peak_equity`, `equity` (current equity), `headroom` and `breached`. Use this to self-limit. |
+| `policy` | none | The signed policy in force: `version`, `hash`, `signed_by`, `loaded_at`, this bot's `core` limits, its `hyperliquid` limits and `modules` switches, and a plain-language `summary`. Allowlists are counted, not listed. |
 | `balances` | `chain_id` (optional) | Native and priced-token balances, on one chain or all configured chains. |
 | `tx_status` | `chain_id`, and `tx_hash` or `request_id` | One of `pending_user_approval`, `executing`, `refused`, `pending`, `confirmed`, `failed`, `unknown`. |
 | `simulate` | `chain_id`, `to`, `data` (optional), `value_wei` (optional) | The policy verdict, the gas estimate, and whether the call reverts. Nothing is signed or recorded. |

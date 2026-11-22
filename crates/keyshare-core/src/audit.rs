@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::chainlog::{ChainLog, Head, LogError};
+use crate::policy_file::PolicyRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,10 @@ pub enum AuditEvent {
     Held,
     Refused,
     Signed,
+    /// A signed policy was accepted and is now active.
+    PolicyLoaded,
+    /// A policy file was refused (unsigned, wrong key, older version). The old one stays active.
+    PolicyRejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +29,10 @@ pub struct AuditEntry {
     pub caller: String,
     pub event: AuditEvent,
     pub detail: serde_json::Value,
+    /// The signed policy that was active when this entry was written. Absent on entries written
+    /// before policies were signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyRef>,
 }
 
 pub struct AuditLog(ChainLog<AuditEntry>);

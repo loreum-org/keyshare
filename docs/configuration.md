@@ -1,6 +1,11 @@
 # Configuration
 
-Keyshare reads one TOML file. `keyshare.example.toml` in the repo root is a working example with comments. Unknown settings are rejected, so a typo fails at start instead of being ignored.
+Keyshare reads two TOML files:
+
+- **The config** (`keyshare.example.toml` in the repo root): the server, chains, and each bot's login and key variable.
+- **The policy** (`policy.example.toml`): what each bot may do, and the prices caps are measured in. The owner signs it, and the server refuses to load it otherwise. See [Signed policy](policy-signing.md).
+
+Both examples have comments. Unknown settings are rejected, so a typo fails at start instead of being ignored.
 
 Secrets never go in this file. Bot keys come from environment variables, and bot tokens are stored only as hashes.
 
@@ -14,6 +19,9 @@ Secrets never go in this file. Bot keys come from environment variables, and bot
 | `spend_anchor` | no | Where to keep a copy of the spend log's latest entry. Default is inside `state_dir`. Put it on another disk. See [Safety and state](safety.md). |
 | `admin_token_sha256` | no | Hash of the token for `GET /admin/pending` (make one with `keyshare-mcp new-token`). Without it, the pending list is off. |
 | `hold_secs` | no | How long a held request waits for the owner, in seconds. Default 900 (15 minutes). |
+| `policy` | yes | Path to the signed policy file. The signature is read from the same path plus `.sig`. |
+| `policy_signers` | yes | Addresses allowed to sign the policy. The server won't start without a policy signed by one of them. |
+| `policy_reload_secs` | no | How often to look for a newly signed policy, in seconds. Default 5. `0` turns hot reload off. |
 
 ## `[hyperliquid]`
 
@@ -40,7 +48,27 @@ One entry per chain the server can reach.
 | `weth` | Wrapped native token (used when selling the native token). |
 | `fee_tiers` | Pool fee tiers to try. Default `[500, 3000, 10000]`. |
 
-## `[[prices]]`
+## `[bots.<name>]` (config)
+
+One section per bot, in the config. The name (e.g. `filltape`) is the bot's id in logs and the kill switch. It can't contain `:`.
+
+| Setting | Required | Meaning |
+|---|---|---|
+| `credential_sha256` | yes | Hash of the bot's login token. Two bots can't share a token. |
+| `key_env` | yes | Environment variable that holds the bot's private key. |
+| `admin_keys` | no | Owner addresses that can approve or deny this bot's held requests. With none, over-limit requests are simply refused. |
+
+## Policy file
+
+Everything below this point goes in the policy file, not the config. The policy starts with a `version` number, which must go up with every change:
+
+```toml
+version = 3
+```
+
+Every bot in the config needs a section in the policy, and the policy can't name a bot the config doesn't have.
+
+### `[[prices]]`
 
 Fixed USD prices used to value every outflow against the caps. Phase 0 has no live price feed.
 
@@ -53,17 +81,7 @@ Fixed USD prices used to value every outflow against the caps. Phase 0 has no li
 
 A token with no price can't be sent, approved or bought. The request is refused with `PRICE_UNAVAILABLE`. This is on purpose: Keyshare won't move value it can't count.
 
-## `[bots.<name>]`
-
-One section per bot. The name (e.g. `filltape`) is the bot's id in logs and the kill switch. It can't contain `:`.
-
-| Setting | Required | Meaning |
-|---|---|---|
-| `credential_sha256` | yes | Hash of the bot's login token. Two bots can't share a token. |
-| `key_env` | yes | Environment variable that holds the bot's private key. |
-| `admin_keys` | no | Owner addresses that can approve or deny this bot's held requests. With none, over-limit requests are simply refused. |
-
-## `[bots.<name>.policy]`
+### `[bots.<name>.core]`
 
 The bot's spending rules. [Policy](policy.md) explains how each is applied.
 
@@ -79,7 +97,7 @@ The bot's spending rules. [Policy](policy.md) explains how each is applied.
 | `max_slippage_bps` | no | Most a swap may give up below its quote, in basis points. Default 100 (1%). |
 | `max_price_deviation_bps` | no | How far a swap's guaranteed output may fall below the input's value at configured prices. Default 500 (5%). |
 
-`[[bots.<name>.policy.contracts_allow]]`:
+`[[bots.<name>.core.contracts_allow]]`:
 
 | Setting | Meaning |
 |---|---|
@@ -87,7 +105,7 @@ The bot's spending rules. [Policy](policy.md) explains how each is applied.
 | `selectors` | Function selectors allowed on it, e.g. `"0xa9059cbb"` for ERC-20 `transfer`. |
 | `chains` | Chains this rule applies to. Leave out (or empty) for every chain the bot may use. Set it when the same address means something else on another chain. |
 
-`[[bots.<name>.policy.typed_data_allow]]`:
+`[[bots.<name>.core.typed_data_allow]]`:
 
 | Setting | Meaning |
 |---|---|
@@ -97,7 +115,7 @@ The bot's spending rules. [Policy](policy.md) explains how each is applied.
 | `chain_id` | Required chain. Default: any of the bot's chains. |
 | `chainless` | Set to `true` to allow domains that have no chain id. |
 
-## `[bots.<name>.modules]`
+### `[bots.<name>.modules]`
 
 Which protocol modules this bot is offered. Leave the section out to offer every module. See [Protocol modules](modules.md).
 
@@ -106,7 +124,7 @@ Which protocol modules this bot is offered. Leave the section out to offer every
 | `hyperliquid` | `true` | `false` removes the `hl_*` tools from this bot's tool list. |
 | `uniswap` | `true` | `false` removes the `swap` tool from this bot's tool list. |
 
-## `[bots.<name>.hyperliquid]`
+### `[bots.<name>.hyperliquid]`
 
 Without this section the bot can't use the Hyperliquid tools. [Hyperliquid](hyperliquid.md) explains each limit.
 

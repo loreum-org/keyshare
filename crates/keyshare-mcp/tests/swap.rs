@@ -16,7 +16,6 @@ use http::Request;
 use keyshare_core::Signer;
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
-use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
 use keyshare_signer::LocalSigner;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -195,14 +194,11 @@ async fn fixture() -> Fixture {
         hash = token_hash(TOKEN),
         other_hash = token_hash(OTHER_TOKEN),
     );
-    let path = dir.path().join("keyshare.toml");
-    std::fs::write(&path, toml).unwrap();
+    let path = keyshare_mcp::policy::testing::write_signed(dir.path(), &toml);
     let config = Config::load(&path).unwrap();
     let env: HashMap<&str, &str> = [("FILLTAPE_KEY", KEY), ("OTHER_KEY", OTHER_KEY)].into();
-    let wallet = Arc::new(Mutex::new(config.wallet(|v| env.get(v).map(|s| s.to_string())).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
-    let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
-    let exec = Executor::new(wallet, chains, Arc::new(config.prices.clone()), DEFAULT_HOLD_SECS);
+    let exec = keyshare_mcp::build(&config, |v| env.get(v).map(|s| s.to_string())).await.unwrap();
     let app = keyshare_mcp::app(Arc::new(exec), creds, None, &[]);
     Fixture { app, state, _dir: dir }
 }

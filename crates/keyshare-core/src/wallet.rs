@@ -16,6 +16,7 @@ use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::chainlog::LogError;
 use crate::killswitch::KillSwitch;
 use crate::policy::{Action, PolicyEngine, Verdict};
+use crate::policy_file::PolicyRef;
 use crate::price::{PriceSource, UsdMicros};
 use crate::refusal::{Refusal, RefusalCode};
 use crate::signer::Signer;
@@ -51,6 +52,16 @@ pub struct Wallet {
     spend: SpendLog,
     audit: AuditLog,
     kill: KillSwitch,
+    /// The signed policy in force. Stamped on every audit entry.
+    policy: Option<PolicyRef>,
+}
+
+/// What the policy check saw, recorded on the decision's audit entry so a verifier can re-run it
+/// against the signed policy (`keyshare-mcp policy-verify`).
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PolicyCheck {
+    spent_24h_usd_micros: UsdMicros,
+    owner_approved: bool,
 }
 
 fn internal(e: impl std::fmt::Display) -> Refusal {
@@ -69,7 +80,44 @@ impl Wallet {
             spend: SpendLog::open(&paths.spend_log, paths.spend_anchor.clone())?,
             audit: AuditLog::open(&paths.audit_log)?,
             kill: KillSwitch::new(&paths.kill_switch),
+            policy: None,
         })
+    }
+
+    /// The signed policy in force, if one was loaded.
+    pub fn policy_ref(&self) -> Option<PolicyRef> {
+        self.policy
+    }
+
+    /// Makes `policy` the active signed policy and logs `PolicyLoaded`. `engines` must name
+    /// exactly the wallet's callers: a policy can't add or drop a bot, since keys and tokens come
+    /// from the config.
+    pub fn apply_policy(
+        &mut self,
+        policy: PolicyRef,
+        mut engines: HashMap<String, Box<dyn PolicyEngine>>,
+        prices: Box<dyn PriceSource>,
+        detail: serde_json::Value,
+        now: u64,
+    ) -> Result<(), String> {
+        let mut missing: Vec<&String> = self.accounts.keys().filter(|b| !engines.contains_key(*b)).collect();
+        let mut extra: Vec<&String> = engines.keys().filter(|b| !self.accounts.contains_key(*b)).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            missing.sort();
+            extra.sort();
+            return Err(format!(
+                "policy must cover exactly the configured bots; missing {missing:?}, unknown {extra:?}"
+            ));
+        }
+        for (bot, account) in &mut self.accounts {
+            if let Some(engine) = engines.remove(bot) {
+                account.policy = engine;
+            }
+        }
+        self.prices = prices;
+        self.policy = Some(policy);
+        self.log_event("", "policy", AuditEvent::PolicyLoaded, detail, now);
+        Ok(())
     }
 
     pub fn kill_switch(&self) -> &KillSwitch {
@@ -145,15 +193,18 @@ impl Wallet {
         approved_by: Option<Address>,
         now: u64,
     ) -> Result<SignedTx, Refusal> {
+        let from = self.accounts.get(caller).map(|a| a.signer.address());
         let detail = json!({
             "approved_by": approved_by,
             "kind": "transaction",
+            "from": from,
             "chain_id": tx.chain_id,
             "nonce": tx.nonce,
             "to": tx.to.to(),
             "value": tx.value,
             "input": tx.input,
             "digest": tx.signature_hash(),
+            "tx": tx,
         });
         let sig =
             self.authorize_and_sign(caller, request_id, Action::Transaction(&tx), approved_by, detail, now, |s| {
@@ -170,7 +221,11 @@ impl Wallet {
         message: &[u8],
         now: u64,
     ) -> Result<Signature, Refusal> {
-        let detail = json!({ "kind": "message", "message": String::from_utf8_lossy(message) });
+        let detail = json!({
+            "kind": "message",
+            "message": String::from_utf8_lossy(message),
+            "message_hex": Bytes::copy_from_slice(message),
+        });
         self.authorize_and_sign(caller, request_id, Action::Message(message), None, detail, now, |s| {
             s.sign_message(message)
         })
@@ -200,29 +255,36 @@ impl Wallet {
         now: u64,
         sign: impl FnOnce(&dyn Signer) -> Result<Signature, crate::signer::SignerError>,
     ) -> Result<Signature, Refusal> {
+        let policy = self.policy;
         let entry = |event, detail| AuditEntry {
             at: now,
             request_id: request_id.to_string(),
             caller: caller.to_string(),
             event,
             detail,
+            policy,
         };
         // No audit entry, no signature.
         self.audit.append(&entry(AuditEvent::Requested, detail)).map_err(internal)?;
 
-        match self.authorize(caller, request_id, action, approved_by.is_some(), now) {
-            Ok(()) => {}
-            Err(refusal) => {
+        let checked = match self.authorize(caller, request_id, action, approved_by.is_some(), now) {
+            Ok(checked) => checked,
+            Err((refusal, checked)) => {
+                let mut detail = json!(refusal);
+                if let Some(checked) = checked {
+                    detail["policy_check"] = json!(checked);
+                }
                 // The refusal stands even if this write fails.
-                let _ = self.audit.append(&entry(AuditEvent::Refused, json!(refusal)));
+                let _ = self.audit.append(&entry(AuditEvent::Refused, detail));
                 return Err(refusal);
             }
-        }
+        };
 
         let account = self.account(caller)?;
         match sign(account.signer.as_ref()) {
             Ok(sig) => {
-                self.audit.append(&entry(AuditEvent::Signed, json!({ "signature": sig }))).map_err(internal)?;
+                let detail = json!({ "signature": sig, "policy_check": checked });
+                self.audit.append(&entry(AuditEvent::Signed, detail)).map_err(internal)?;
                 Ok(sig)
             }
             Err(e) => {
@@ -251,7 +313,14 @@ impl Wallet {
         detail: serde_json::Value,
         now: u64,
     ) {
-        let entry = AuditEntry { at: now, request_id: request_id.into(), caller: caller.into(), event, detail };
+        let entry = AuditEntry {
+            at: now,
+            request_id: request_id.into(),
+            caller: caller.into(),
+            event,
+            detail,
+            policy: self.policy,
+        };
         let _ = self.audit.append(&entry);
     }
 
@@ -265,7 +334,14 @@ impl Wallet {
         now: u64,
     ) {
         for (event, detail) in [(AuditEvent::Requested, detail), (AuditEvent::Refused, json!(refusal))] {
-            let entry = AuditEntry { at: now, request_id: request_id.into(), caller: caller.into(), event, detail };
+            let entry = AuditEntry {
+                at: now,
+                request_id: request_id.into(),
+                caller: caller.into(),
+                event,
+                detail,
+                policy: self.policy,
+            };
             let _ = self.audit.append(&entry);
         }
     }
@@ -282,16 +358,19 @@ impl Wallet {
         action: Action<'_>,
         owner_approved: bool,
         now: u64,
-    ) -> Result<(), Refusal> {
-        self.spend.check_request_id(request_id)?;
+    ) -> Result<PolicyCheck, (Refusal, Option<PolicyCheck>)> {
+        let before = |r: Refusal| (r, None);
+        self.spend.check_request_id(request_id).map_err(before)?;
+        let account = self.account(caller).map_err(before)?;
+        self.kill.check(caller).map_err(before)?;
+        self.spend.check_anchor().map_err(before)?;
+        let checked = PolicyCheck { spent_24h_usd_micros: self.spend.spent_24h(caller, now), owner_approved };
         let verdict = if owner_approved {
-            let account = self.account(caller)?;
-            self.kill.check(caller)?;
-            self.spend.check_anchor()?;
-            account.policy.check_owner_approved(action, self.prices.as_ref())?
+            account.policy.check_owner_approved(action, self.prices.as_ref())
         } else {
-            self.preview(caller, action, now)?
-        };
+            account.policy.check(action, checked.spent_24h_usd_micros, self.prices.as_ref())
+        }
+        .map_err(|r| (r, Some(checked)))?;
         // Recorded on approval, before signing (design §6.4). This also burns the request id.
         self.spend
             .record(SpendEntry {
@@ -300,7 +379,7 @@ impl Wallet {
                 usd_micros: verdict.outflow_usd,
                 at: now,
             })
-            .map_err(internal)?;
-        Ok(())
+            .map_err(|e| (internal(e), None))?;
+        Ok(checked)
     }
 }

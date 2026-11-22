@@ -29,12 +29,13 @@ pub async fn approve_agent(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<SavedAgent, String> {
     let cfg = config.bots.get(bot).ok_or_else(|| format!("no bot {bot} in the config"))?;
-    if cfg.hyperliquid.is_none() {
-        return Err(format!("bot {bot} has no [bots.{bot}.hyperliquid] table"));
+    let policy = crate::policy::load(config).map_err(|e| e.to_string())?;
+    if policy.set.bots.get(bot).is_none_or(|b| b.hyperliquid.is_none()) {
+        return Err(format!("bot {bot} has no [bots.{bot}.hyperliquid] section in the signed policy"));
     }
     let key = env(&cfg.key_env).ok_or_else(|| format!("{} is not set", cfg.key_env))?;
     let master = LocalSigner::from_hex(&key).map_err(|e| e.to_string())?;
-    let venue = config.hyperliquid().map_err(|e| e.to_string())?;
+    let venue = config.hyperliquid(&policy.set).map_err(|e| e.to_string())?;
     let agent = NewAgent::generate()?;
     let approved = keyshare_hyperliquid::approve_agent(
         &venue,

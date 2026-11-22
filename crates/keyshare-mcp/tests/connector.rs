@@ -13,7 +13,7 @@ use keyshare_core::Signer;
 use keyshare_core::Wallet;
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
-use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
+use keyshare_mcp::exec::DEFAULT_HOLD_SECS;
 use keyshare_signer::LocalSigner;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -97,6 +97,7 @@ async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
         listen = "127.0.0.1:0"
         state_dir = "{state}"
         admin_token_sha256 = "{admin_hash}"
+        hold_secs = {hold_secs}
 
         [[chains]]
         id = 11155111
@@ -146,15 +147,12 @@ async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
         admin_hash = token_hash(ADMIN_TOKEN),
         admin = admin().address(),
     );
-    let path = dir.path().join("keyshare.toml");
-    std::fs::write(&path, toml).unwrap();
+    let path = keyshare_mcp::policy::testing::write_signed(dir.path(), &toml);
     let config = Config::load(&path).unwrap();
     let env: HashMap<&str, &str> = [("FILLTAPE_KEY", KEY), ("TRADER_KEY", TRADER_KEY)].into();
-    let wallet = Arc::new(Mutex::new(config.wallet(|v| env.get(v).map(|s| s.to_string())).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
-    let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
-    let tokens = Arc::new(config.prices.clone());
-    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, hold_secs));
+    let exec = Arc::new(keyshare_mcp::build(&config, |v| env.get(v).map(|s| s.to_string())).await.unwrap());
+    let wallet = exec.wallet();
     let hosts: Vec<String> = allowed_hosts.iter().map(|h| (*h).to_string()).collect();
     let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &hosts);
     Fixture { app, wallet, sent, _dir: dir }
@@ -294,6 +292,7 @@ async fn lists_tools() {
             "hl_positions",
             "hl_set_leverage",
             "limits",
+            "policy",
             "send",
             "sign_message",
             "sign_typed_data",
@@ -354,6 +353,24 @@ async fn kill_switch_halts_signing() {
     // Read tools still work.
     let out = call(&f.app, s.as_deref(), "limits", json!({})).await;
     assert_eq!(out["structuredContent"]["daily_cap_usd"], 500);
+}
+
+#[tokio::test]
+async fn policy_tool_reports_the_signed_policy() {
+    let f = fixture().await;
+    let s = session(&f.app).await;
+    let out = call(&f.app, s.as_deref(), "policy", json!({})).await;
+    let p = &out["structuredContent"];
+    assert_eq!(p["version"], 1, "{out}");
+    assert_eq!(p["signed_by"], json!(keyshare_mcp::policy::testing::owner().address()));
+    assert_eq!(p["core"]["per_tx_cap_usd"], 200);
+    assert_eq!(p["modules"]["uniswap"], true);
+    let summary = p["summary"].as_str().unwrap();
+    assert!(summary.contains("Up to $200 per transaction and $500 per rolling 24 hours"), "{summary}");
+    assert!(summary.contains("Hyperliquid: off."), "{summary}");
+    // The hash matches what the audit log records.
+    let active = f.wallet.lock().unwrap().policy_ref().unwrap();
+    assert_eq!(p["hash"], json!(active.hash));
 }
 
 fn code(out: &Value) -> &str {
