@@ -22,3 +22,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
+
+# Threshold key generation is ~100x slower unoptimized; keep tests and debug builds usable.
+[profile.dev.package.dkls23-core]
+opt-level = 3
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3

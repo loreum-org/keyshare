@@ -33,7 +33,13 @@ pub async fn approve_agent(
     if policy.set.bots.get(bot).is_none_or(|b| b.hyperliquid.is_none()) {
         return Err(format!("bot {bot} has no [bots.{bot}.hyperliquid] section in the signed policy"));
     }
-    let key = env(&cfg.key_env).ok_or_else(|| format!("{} is not set", cfg.key_env))?;
+    // A threshold bot's co-signer only signs what the bot's policy allows, and the Hyperliquid
+    // approval is an owner action outside it. Not supported for threshold bots yet.
+    let var = cfg
+        .key_env
+        .as_deref()
+        .ok_or_else(|| format!("bot {bot} uses a threshold key; hl-approve-agent needs a single-key bot for now"))?;
+    let key = env(var).ok_or_else(|| format!("{var} is not set"))?;
     let master = LocalSigner::from_hex(&key).map_err(|e| e.to_string())?;
     let venue = config.hyperliquid(&policy.set).map_err(|e| e.to_string())?;
     let agent = NewAgent::generate()?;

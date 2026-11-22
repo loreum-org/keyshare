@@ -56,6 +56,8 @@ The server binary is `keyshare-mcp`.
 | `keyshare-mcp policy-hash <policy>` | Prints the policy's version, its hash, and the exact message to sign. |
 | `keyshare-mcp policy-sign <policy> <KEY_ENV>` | Signs the policy with the key in that environment variable and writes `<policy>.sig`. A testnet convenience; for a real owner key, sign the message from `policy-hash` in your own wallet. |
 | `keyshare-mcp policy-verify <policy> <audit.jsonl>` | Re-checks every decision the audit log says was made under this policy. Exits non-zero if any doesn't follow. |
+| `keyshare-mcp threshold-keygen <dir>` | Makes a new 2-of-2 threshold key: writes `share.json` and `cosigner.share.json` in that folder and prints the address. See [Threshold signing](threshold.md). |
+| `keyshare-mcp threshold-refresh <share> <cosigner-share>` | Replaces both shares with new ones for the same address. Stop the server first. |
 | `keyshare-mcp policy-migrate <old-config> <new-config> <policy>` | Splits a config from before signed policies (rules inline under `[bots.<name>.policy]`) into a config and an unsigned version-1 policy. |
 
 `freeze`, `unfreeze` and `hl-approve-agent` run on the same machine as the server, against the same config and state folder. `hl-approve-agent` needs the bot's key variable set, like `serve`.

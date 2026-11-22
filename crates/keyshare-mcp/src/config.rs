@@ -5,10 +5,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use alloy::primitives::{Address, B256};
 use keyshare_core::{Account, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
 use keyshare_signer::LocalSigner;
+use keyshare_signer::threshold::{KeyShare, LocalCoSigner, ThresholdSigner};
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
@@ -100,13 +102,36 @@ fn push_allowed_host(hosts: &mut Vec<String>, raw: &str) {
 pub struct BotConfig {
     /// SHA-256 of the bot's bearer token (`keyshare-mcp new-token` prints both).
     pub credential_sha256: B256,
-    /// Environment variable holding this bot's testnet private key.
-    pub key_env: String,
+    /// Environment variable holding this bot's testnet private key. Set this or `threshold`.
+    #[serde(default)]
+    pub key_env: Option<String>,
+    /// A 2-of-2 threshold key instead of `key_env` (`keyshare-mcp threshold-keygen`).
+    #[serde(default)]
+    pub threshold: Option<ThresholdConfig>,
     /// The owner's admin keys (Ethereum addresses). With at least one, refusals the owner can
     /// waive are held for approval instead of refused (design §13.2).
     #[serde(default)]
     pub admin_keys: Vec<Address>,
 }
+
+/// Where a threshold bot's key shares live. Both are files written with mode 0600.
+///
+/// With `cosigner_share` the co-signer runs inside this server: it re-checks every request against
+/// its own copy of the signed policy and its own spend log, but it is on the same machine, so a
+/// compromised host has both shares. That is for testnet. A co-signer on another machine is the
+/// next step (docs/threshold.md).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThresholdConfig {
+    pub share: PathBuf,
+    pub cosigner_share: PathBuf,
+}
+
+/// A bot's signer, and its in-process co-signer if it has a threshold key.
+type BotSigner = (Box<dyn Signer>, Option<Arc<LocalCoSigner>>);
+
+/// In-process co-signers by bot id. The executor hands each one the signed policy on every load.
+pub type CoSigners = HashMap<String, (Arc<LocalCoSigner>, Vec<Address>)>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -176,20 +201,65 @@ impl Config {
         self.server.state_dir.join("policy.state.json")
     }
 
-    /// Builds the wallet under `policy`, reading each bot's key with `env`.
-    pub fn wallet(&self, env: impl Fn(&str) -> Option<String>, policy: &PolicySet) -> Result<Wallet, ConfigError> {
+    /// Where an in-process co-signer keeps its own spend log, apart from the wallet's.
+    pub fn cosigner_spend_log(&self, bot: &str) -> PathBuf {
+        self.server.state_dir.join("cosigner").join(format!("{bot}.spend.jsonl"))
+    }
+
+    /// Builds one bot's signer: a single key from `key_env`, or a threshold share and its co-signer.
+    fn signer(
+        &self,
+        bot: &str,
+        cfg: &BotConfig,
+        env: &impl Fn(&str) -> Option<String>,
+    ) -> Result<BotSigner, ConfigError> {
+        let bad = |why: String| ConfigError::BadKey { bot: bot.to_string(), why };
+        match (&cfg.key_env, &cfg.threshold) {
+            (Some(var), None) => {
+                let key = env(var).ok_or_else(|| ConfigError::MissingKey { bot: bot.to_string(), var: var.clone() })?;
+                let signer = LocalSigner::from_hex(&key).map_err(|e| bad(e.to_string()))?;
+                Ok((Box::new(signer), None))
+            }
+            (None, Some(t)) => {
+                let share = KeyShare::load(&t.share).map_err(|e| bad(e.to_string()))?;
+                let co_share = KeyShare::load(&t.cosigner_share).map_err(|e| bad(e.to_string()))?;
+                if share.address() != co_share.address() {
+                    return Err(bad("share and cosigner_share are for different addresses".into()));
+                }
+                let log = self.cosigner_spend_log(bot);
+                if let Some(dir) = log.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| ConfigError::Read(dir.to_path_buf(), e))?;
+                }
+                let co = Arc::new(LocalCoSigner::new(co_share, &log).map_err(|e| bad(e.to_string()))?);
+                let signer = ThresholdSigner::new(share, co.clone()).map_err(|e| bad(e.to_string()))?;
+                Ok((Box::new(signer), Some(co)))
+            }
+            _ => Err(bad("set exactly one of key_env or threshold".into())),
+        }
+    }
+
+    /// Builds the wallet under `policy`, reading each bot's key with `env`. Also returns the
+    /// in-process co-signers of threshold bots, which refuse everything until given a policy.
+    pub fn wallet(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+        policy: &PolicySet,
+    ) -> Result<(Wallet, CoSigners), ConfigError> {
         let mut accounts = HashMap::new();
+        let mut cosigners = CoSigners::new();
+        std::fs::create_dir_all(&self.server.state_dir)
+            .map_err(|e| ConfigError::Read(self.server.state_dir.clone(), e))?;
         for (bot, cfg) in &self.bots {
             let rules = policy.bots.get(bot).ok_or_else(|| ConfigError::Other(format!("policy has no bot {bot}")))?;
-            let key = env(&cfg.key_env)
-                .ok_or_else(|| ConfigError::MissingKey { bot: bot.clone(), var: cfg.key_env.clone() })?;
-            let signer = LocalSigner::from_hex(&key)
-                .map_err(|e| ConfigError::BadKey { bot: bot.clone(), why: e.to_string() })?;
+            let (signer, co) = self.signer(bot, cfg, &env)?;
+            if let Some(co) = co {
+                cosigners.insert(bot.clone(), (co, cfg.admin_keys.clone()));
+            }
             let own = signer.address();
             accounts.insert(
                 bot.clone(),
                 Account {
-                    signer: Box::new(signer),
+                    signer,
                     policy: Box::new(PlainPolicy { own_address: Some(own), ..rules.core.clone() }),
                     admins: cfg.admin_keys.clone(),
                 },
@@ -198,7 +268,9 @@ impl Config {
         let prices = PriceTable::from_entries(&policy.prices).map_err(|e| ConfigError::Other(e.to_string()))?;
         std::fs::create_dir_all(&self.server.state_dir)
             .map_err(|e| ConfigError::Read(self.server.state_dir.clone(), e))?;
-        Wallet::open(accounts, Box::new(prices), &self.state_paths()).map_err(|e| ConfigError::Other(e.to_string()))
+        let wallet = Wallet::open(accounts, Box::new(prices), &self.state_paths())
+            .map_err(|e| ConfigError::Other(e.to_string()))?;
+        Ok((wallet, cosigners))
     }
 
     pub fn hyperliquid(&self, policy: &PolicySet) -> Result<Hyperliquid, ConfigError> {
@@ -276,7 +348,7 @@ mod tests {
         {
             let bot = config.bots.get("filltape").unwrap();
             assert_eq!(bot.credential_sha256, B256::ZERO);
-            assert_eq!(bot.key_env, "FILLTAPE_KEY");
+            assert_eq!(bot.key_env.as_deref(), Some("FILLTAPE_KEY"));
         }
 
         // The image ships policy.example.toml as the starting point for /data/policy.toml.

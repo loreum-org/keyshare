@@ -32,14 +32,15 @@ pub async fn build(config: &Config, env: impl Fn(&str) -> Option<String>) -> Res
     let loaded = policy::load(config).map_err(|e| format!("policy {}: {e}", config.server.policy.display()))?;
     let gate = VersionGate::new(config.policy_state_path());
     gate.check(&loaded.reference).map_err(|e| e.to_string())?;
-    let wallet = config.wallet(env, &loaded.set).map_err(|e| e.to_string())?;
+    let (wallet, cosigners) = config.wallet(env, &loaded.set).map_err(|e| e.to_string())?;
     let chains = Arc::new(Chains::new(&config.chains).map_err(|e| e.to_string())?);
     let tokens = Arc::new(loaded.set.prices.clone());
     let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
     let hl = config.hyperliquid(&loaded.set).map_err(|e| e.to_string())?;
     let exec = Executor::new(Arc::new(std::sync::Mutex::new(wallet)), chains, tokens, hold)
         .with_hyperliquid(hl)
-        .with_modules(loaded.set.modules());
+        .with_modules(loaded.set.modules())
+        .with_cosigners(cosigners);
     exec.apply_policy(loaded, &gate).await?;
     Ok(exec)
 }

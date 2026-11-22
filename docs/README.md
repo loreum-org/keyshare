@@ -12,6 +12,7 @@ These docs cover what is built today (Phase 0). The long-term design, including 
 | [Tools](tools.md) | Every tool a bot can call, its inputs and what it returns, and the refusal codes |
 | [Policy](policy.md) | How a request is checked: chains, allowlists, caps, prices, typed data, blocked calls |
 | [Signed policy](policy-signing.md) | How the owner signs and versions the policy, hot reload, the verifier, and how this leads to ZK proofs |
+| [Threshold signing](threshold.md) | 2-of-2 threshold keys: setup, refresh, moving a bot over, what each party can and can't do, and the library choice |
 | [Owner approvals](owner-approvals.md) | How over-limit requests wait for the owner, and how the owner approves or denies them |
 | [Swaps](swaps.md) | Uniswap v3 swaps and their safety checks |
 | [Hyperliquid](hyperliquid.md) | Trading on Hyperliquid testnet with agent keys and trading limits |

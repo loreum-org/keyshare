@@ -45,6 +45,8 @@ pub enum RefusalCode {
     VenueUnavailable,
     /// The request itself is malformed.
     BadArgs,
+    /// A co-signer holds a different signed policy than the one the request was checked under.
+    PolicyMismatch,
     Internal,
 }
 

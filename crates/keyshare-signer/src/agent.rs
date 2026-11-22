@@ -102,7 +102,7 @@ pub fn open(state_dir: &Path, bot: &str, now_ms: u64) -> Result<LocalSigner, Ope
 }
 
 /// Writes a file only its owner can read, replacing any old one.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {

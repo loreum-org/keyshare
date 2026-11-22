@@ -7,7 +7,7 @@ use keyshare_core::killswitch::KillSwitch;
 use keyshare_mcp::auth::new_token;
 use keyshare_mcp::config::Config;
 use keyshare_mcp::{hl, policy};
-use keyshare_signer::LocalSigner;
+use keyshare_signer::{LocalSigner, threshold};
 
 const USAGE: &str = "\
 usage:
@@ -26,7 +26,11 @@ usage:
                                                re-check every logged decision made under this policy
   keyshare-mcp policy-migrate <old-config.toml> <new-config.toml> <policy.toml>
                                                split an old config with inline rules into a config
-                                               and an unsigned version-1 policy";
+                                               and an unsigned version-1 policy
+  keyshare-mcp threshold-keygen <dir>          new 2-of-2 threshold key: writes <dir>/share.json and
+                                               <dir>/cosigner.share.json and prints the address
+  keyshare-mcp threshold-refresh <share.json> <cosigner.share.json>
+                                               re-randomize both shares in place; same address";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -49,6 +53,8 @@ async fn main() -> ExitCode {
         ["policy-sign", path, key_env] => policy_sign(path, key_env),
         ["policy-verify", path, audit] => policy_verify(path, audit),
         ["policy-migrate", old, new, out] => policy_migrate(old, new, out),
+        ["threshold-keygen", dir] => threshold_keygen(Path::new(dir)),
+        ["threshold-refresh", share, co] => threshold_refresh(Path::new(share), Path::new(co)),
         _ => Err(USAGE.into()),
     };
     match result {
@@ -114,6 +120,47 @@ async fn approve_agent(path: &str, bot: &str, hours: u64) -> Result<()> {
     let saved = hl::approve_agent(&config, bot, hours, |var| std::env::var(var).ok()).await?;
     println!("approved agent {} until {} (unix ms)", saved.address, saved.valid_until_ms);
     println!("saved to {}", saved.path.display());
+    Ok(())
+}
+
+fn threshold_keygen(dir: &Path) -> Result<()> {
+    let (share, co) = threshold::generate_2of2()?;
+    let (a, b) = (dir.join("share.json"), dir.join("cosigner.share.json"));
+    for path in [&a, &b] {
+        if path.exists() {
+            return Err(format!("{} already exists; not overwriting a key share", path.display()).into());
+        }
+    }
+    share.save(&a)?;
+    co.save(&b)?;
+    println!(
+        "address: {}
+bot share:       {}
+co-signer share: {}
+
+In the config:
+  [bots.<name>.threshold]
+  share = \"{}\"
+  cosigner_share = \"{}\"",
+        share.address(),
+        a.display(),
+        b.display(),
+        a.display(),
+        b.display()
+    );
+    Ok(())
+}
+
+fn threshold_refresh(share_path: &Path, co_path: &Path) -> Result<()> {
+    let (share, co) = (threshold::KeyShare::load(share_path)?, threshold::KeyShare::load(co_path)?);
+    let (share2, co2) = threshold::refresh_2of2(&share, &co)?;
+    // Write both new shares before replacing either, so a failure leaves a matching pair.
+    let (tmp_a, tmp_b) = (share_path.with_extension("new"), co_path.with_extension("new"));
+    share2.save(&tmp_a)?;
+    co2.save(&tmp_b)?;
+    std::fs::rename(&tmp_a, share_path)?;
+    std::fs::rename(&tmp_b, co_path)?;
+    println!("refreshed both shares; address unchanged: {}", share2.address());
     Ok(())
 }
 
