@@ -122,18 +122,7 @@ fn env(var: &str) -> Option<String> {
     env.get(var).map(|s| s.to_string())
 }
 
-async fn fixture() -> Fixture {
-    let venue = Arc::new(Mutex::new(Venue {
-        account_value: "10000.0".into(),
-        eth_szi: "0.0".into(),
-        include_positions: true,
-        abstraction: json!("default"),
-        eth_mark: "2500.0".into(),
-        leverage: 3,
-        ..Default::default()
-    }));
-    let api = mock_hl(venue.clone()).await;
-    let dir = tempfile::tempdir().unwrap();
+fn write_config(dir: &std::path::Path, state: &std::path::Path, api: &str, hl_extra: &str) -> Config {
     let toml = format!(
         r#"
         [server]
@@ -156,6 +145,7 @@ async fn fixture() -> Fixture {
         max_position_usd = 2000
         max_leverage = 5
         daily_loss_stop_usd = 100
+        {hl_extra}
 
         [bots.plain]
         credential_sha256 = "{plain_hash}"
@@ -165,20 +155,54 @@ async fn fixture() -> Fixture {
         per_tx_cap_usd = 0
         daily_cap_usd = 0
         "#,
-        state = dir.path().join("state").display(),
+        state = state.display(),
         hash = token_hash(TOKEN),
         plain_hash = token_hash(PLAIN_TOKEN),
     );
-    let path = dir.path().join("keyshare.toml");
+    let path = dir.join("keyshare.toml");
     std::fs::write(&path, toml).unwrap();
-    let config = Config::load(&path).unwrap();
+    Config::load(&path).unwrap()
+}
+
+fn serve(config: &Config) -> Router {
     let wallet = Arc::new(Mutex::new(config.wallet(env).unwrap()));
     let creds: Credentials = Arc::new(config.credentials().unwrap());
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
     let exec = Executor::new(wallet, chains, Arc::new(vec![]), DEFAULT_HOLD_SECS)
         .with_hyperliquid(config.hyperliquid().unwrap());
-    let app = keyshare_mcp::app(Arc::new(exec), creds, None, &[]);
+    keyshare_mcp::app(Arc::new(exec), creds, None, &[])
+}
+
+async fn fixture() -> Fixture {
+    fixture_with("").await
+}
+
+async fn fixture_with(hl_extra: &str) -> Fixture {
+    let venue = Arc::new(Mutex::new(Venue {
+        account_value: "10000.0".into(),
+        eth_szi: "0.0".into(),
+        include_positions: true,
+        abstraction: json!("default"),
+        eth_mark: "2500.0".into(),
+        leverage: 3,
+        ..Default::default()
+    }));
+    let api = mock_hl(venue.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), &dir.path().join("state"), &api, hl_extra);
+    let app = serve(&config);
     Fixture { app, config, venue, _dir: dir }
+}
+
+fn restart(f: &Fixture) -> Router {
+    serve(&f.config)
+}
+
+/// A new process: same state directory and mock, with a different floor config.
+fn reload(f: &Fixture, hl_extra: &str) -> Router {
+    let api = f.config.hyperliquid.as_ref().unwrap().api_url.clone().unwrap();
+    let config = write_config(f._dir.path(), &f.config.server.state_dir, &api, hl_extra);
+    serve(&config)
 }
 
 async fn rpc(app: &Router, token: &str, session: Option<&str>, body: Value) -> (Option<String>, Value) {
@@ -307,6 +331,14 @@ async fn approved_agent_signs_orders_within_guardrails() {
     assert_eq!(r["structuredContent"]["account"]["abstraction"], "default");
     assert_eq!(r["structuredContent"]["account"]["equity_source"], "perp_account_value");
     assert!(r["structuredContent"]["account"].get("available_margin").is_none());
+    // No equity floor is configured, so the account is not latched and no mark is written.
+    assert_eq!(r["structuredContent"]["account"]["breached"], false);
+    assert!(r["structuredContent"]["account"]["floor"].is_null());
+    assert!(r["structuredContent"]["account"]["peak_equity"].is_null());
+    let limits = call(&f.app, "limits", json!({})).await;
+    assert_eq!(limits["structuredContent"]["hyperliquid"]["breached"], false);
+    assert!(limits["structuredContent"]["hyperliquid"]["floor"].is_null());
+    assert!(limits["structuredContent"]["hyperliquid"]["equity"].is_null());
 
     // A request id is spent once the agent signs, so a retry cannot place a second order.
     let mut once = buy("0.1", "2500");
@@ -581,6 +613,243 @@ async fn no_agent_kill_switch_and_unconfigured_bot() {
     let r = call_as(&f.app, PLAIN_TOKEN, "hl_place_order", buy("0.1", "2500")).await;
     assert_eq!(code(&r), "MARKET_NOT_ALLOWED");
     assert!(f.venue.lock().unwrap().posted.is_empty());
+}
+
+fn equity_file(f: &Fixture) -> std::path::PathBuf {
+    f.config.server.state_dir.join("hyperliquid/filltape.equity.json")
+}
+
+fn saved_equity(f: &Fixture) -> Value {
+    serde_json::from_slice(&std::fs::read(equity_file(f)).unwrap()).unwrap()
+}
+
+fn reason(result: &Value) -> &str {
+    result["structuredContent"]["reason"].as_str().unwrap()
+}
+
+fn reduce_only(sz: &str) -> Value {
+    json!({"coin": "ETH", "is_buy": false, "sz": sz, "limit_px": "2400", "reduce_only": true})
+}
+
+#[tokio::test]
+async fn equity_floor_latches_until_an_explicit_reset() {
+    let f = fixture_with("equity_floor_usd = 8000").await;
+    approve(&f).await;
+    let limits = call(&f.app, "limits", json!({})).await;
+    let hl = &limits["structuredContent"]["hyperliquid"];
+    assert_eq!(hl["equity_floor_usd"], 8000);
+    assert!(hl["max_drawdown_from_peak_usd"].is_null());
+    assert_eq!(hl["equity"], "10000.0");
+    assert_eq!(hl["floor"], "8000");
+    assert_eq!(hl["peak_equity"], "10000");
+    assert_eq!(hl["headroom"], "2000");
+    assert_eq!(hl["breached"], false);
+    assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+
+    f.venue.lock().unwrap().account_value = "8000".into();
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "EQUITY_FLOOR_BREACHED");
+    assert!(reason(&r).contains("equity 8000"), "{}", reason(&r));
+    assert!(reason(&r).contains("floor 8000"), "{}", reason(&r));
+    assert!(reason(&r).contains("does not flatten"), "{}", reason(&r));
+    assert_eq!(saved_equity(&f)["breached"], true);
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+
+    // Reduce-only orders, a reduce-only stop, and cancels still go out. A stop that can add
+    // risk does not. Modify is checked like a new order.
+    assert_eq!(call(&f.app, "hl_place_order", reduce_only("0.1")).await["isError"], false);
+    let sl = json!({
+        "coin": "ETH", "is_buy": false, "sz": "0.1", "limit_px": "2000",
+        "trigger_px": "2100", "tpsl": "sl", "reduce_only": true
+    });
+    assert_eq!(call(&f.app, "hl_place_order", sl).await["isError"], false);
+    let open_sl = json!({
+        "coin": "ETH", "is_buy": false, "sz": "0.1", "limit_px": "2000",
+        "trigger_px": "2100", "tpsl": "sl"
+    });
+    assert_eq!(code(&call(&f.app, "hl_place_order", open_sl).await), "EQUITY_FLOOR_BREACHED");
+    assert_eq!(call(&f.app, "hl_cancel", json!({"coin": "ETH", "oid": 9})).await["isError"], false);
+    let mut modify = buy("0.1", "2500");
+    modify["oid"] = json!(7);
+    assert_eq!(code(&call(&f.app, "hl_modify", modify).await), "EQUITY_FLOOR_BREACHED");
+
+    // Leverage can go down, not up. The same value again is not an increase.
+    assert_eq!(
+        code(&call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 4})).await),
+        "EQUITY_FLOOR_BREACHED"
+    );
+    assert_eq!(call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 3})).await["isError"], false);
+    assert_eq!(call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 1})).await["isError"], false);
+    let posted = std::mem::take(&mut f.venue.lock().unwrap().posted);
+    assert_eq!(posted.last().unwrap()["action"]["leverage"], 1);
+
+    // Recovery does not clear the latch, and neither does a new process.
+    f.venue.lock().unwrap().account_value = "9500".into();
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "EQUITY_FLOOR_BREACHED");
+    assert!(reason(&r).contains("latched"), "{}", reason(&r));
+    assert!(reason(&r).contains("equity 9500"), "{}", reason(&r));
+    assert!(reason(&r).contains("floor 8000"), "{}", reason(&r));
+    let app = restart(&f);
+    assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
+
+    // Editing the floor number is not a reset.
+    let app = reload(&f, "equity_floor_usd = 1000");
+    assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+
+    // The reset flag clears once. The high-water mark stays where it was.
+    // The day's loss baseline is pinned so the daily stop is not what allows this order.
+    write_day(&f, "9500");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_equity(&f)["breached"], false);
+    assert_eq!(saved_equity(&f)["reset_seen"], true);
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+
+    // A new breach is not cleared by leaving the flag true across a restart.
+    f.venue.lock().unwrap().account_value = "7000".into();
+    assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
+    f.venue.lock().unwrap().account_value = "9500".into();
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
+
+    // Toggle the flag off, then on, once equity is back above the floor.
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = false");
+    assert_eq!(code(&call(&app, "hl_place_order", buy("0.1", "2500")).await), "EQUITY_FLOOR_BREACHED");
+    assert_eq!(saved_equity(&f)["reset_seen"], false);
+    write_day(&f, "9500");
+    let app = reload(&f, "equity_floor_usd = 8000\nreset_equity_floor = true");
+    assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_equity(&f)["breached"], false);
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+}
+
+#[tokio::test]
+async fn unified_equity_floor_uses_spot_usdc_plus_pnl() {
+    let f = fixture_with("equity_floor_usd = 800").await;
+    approve(&f).await;
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.seen.clear();
+    }
+    let r = call(&f.app, "hl_positions", json!({})).await;
+    assert_eq!(r["isError"], false, "{r}");
+    let account = &r["structuredContent"]["account"];
+    assert_eq!(account["equity"], "999.0");
+    assert_eq!(account["floor"], "800");
+    assert_eq!(account["peak_equity"], "999");
+    assert_eq!(account["headroom"], "199");
+    assert_eq!(account["breached"], false);
+    // Perp account value is 0 on this account. Using it as equity would already be a breach.
+    assert_eq!(r["structuredContent"]["state"]["marginSummary"]["accountValue"], "0.0");
+    assert!(f.venue.lock().unwrap().seen.iter().any(|t| t == "spotClearinghouseState"));
+    assert_eq!(call(&f.app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "799.0");
+        v.account_value = "-200".into();
+        v.eth_szi = "0.1".into();
+        v.eth_pnl = Some("-200".into());
+    }
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "EQUITY_FLOOR_BREACHED");
+    assert!(reason(&r).contains("equity 799"), "{}", reason(&r));
+    assert!(reason(&r).contains("floor 800"), "{}", reason(&r));
+    assert_eq!(saved_equity(&f)["peak"], "999");
+    assert_eq!(call(&f.app, "hl_place_order", reduce_only("0.1")).await["isError"], false);
+}
+
+#[tokio::test]
+async fn drawdown_peak_tracks_across_restarts() {
+    let f = fixture_with("max_drawdown_from_peak_usd = 200").await;
+    approve(&f).await;
+    assert_eq!(call(&f.app, "hl_positions", json!({})).await["isError"], false);
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+    assert_eq!(saved_equity(&f)["breached"], false);
+
+    f.venue.lock().unwrap().account_value = "12000".into();
+    let app = restart(&f);
+    let r = call(&app, "hl_positions", json!({})).await;
+    assert_eq!(r["structuredContent"]["account"]["peak_equity"], "12000");
+    assert_eq!(r["structuredContent"]["account"]["floor"], "11800");
+    assert_eq!(r["structuredContent"]["account"]["headroom"], "200");
+    assert_eq!(r["structuredContent"]["account"]["breached"], false);
+    assert_eq!(saved_equity(&f)["peak"], "12000");
+
+    // One tick above the trailing floor is still allowed, and a restart keeps the higher peak.
+    // Pin the daily baseline so the daily loss stop is not the check under test.
+    write_day(&f, "11800.01");
+    f.venue.lock().unwrap().account_value = "11800.01".into();
+    let app = restart(&f);
+    assert_eq!(call(&app, "hl_place_order", buy("0.1", "2500")).await["isError"], false);
+    assert_eq!(saved_equity(&f)["peak"], "12000");
+    assert_eq!(saved_equity(&f)["breached"], false);
+
+    f.venue.lock().unwrap().account_value = "11800".into();
+    let app = restart(&f);
+    let r = call(&app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "EQUITY_FLOOR_BREACHED");
+    assert!(reason(&r).contains("equity 11800"), "{}", reason(&r));
+    assert!(reason(&r).contains("floor 11800"), "{}", reason(&r));
+    assert_eq!(saved_equity(&f)["peak"], "12000");
+    assert_eq!(saved_equity(&f)["breached"], true);
+    assert_eq!(call(&app, "hl_place_order", reduce_only("1")).await["isError"], false);
+}
+
+#[tokio::test]
+async fn unreadable_equity_fails_closed_for_new_risk() {
+    let f = fixture_with("equity_floor_usd = 100\nmax_drawdown_from_peak_usd = 50").await;
+    approve(&f).await;
+    assert_eq!(call(&f.app, "hl_positions", json!({})).await["isError"], false);
+    let before = std::fs::read(equity_file(&f)).unwrap();
+    assert_eq!(saved_equity(&f)["peak"], "10000");
+
+    f.venue.lock().unwrap().abstraction = json!("portfolioMargin");
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "VENUE_UNAVAILABLE");
+    assert!(reason(&r).contains("portfolio margin"), "{}", reason(&r));
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+    assert_eq!(call(&f.app, "hl_place_order", reduce_only("0.1")).await["isError"], false);
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+    // An increase needs a readable equity. A decrease does not.
+    assert_eq!(
+        code(&call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 4})).await),
+        "VENUE_UNAVAILABLE"
+    );
+    assert_eq!(call(&f.app, "hl_set_leverage", json!({"coin": "ETH", "leverage": 2})).await["isError"], false);
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+
+    {
+        let mut v = f.venue.lock().unwrap();
+        unified(&mut v, "999.0", "0.0", "999.0");
+        v.eth_szi = "0.2".into();
+        v.eth_pnl = None;
+    }
+    let r = call(&f.app, "hl_place_order", buy("0.1", "2500")).await;
+    assert_eq!(code(&r), "VENUE_UNAVAILABLE");
+    assert!(reason(&r).contains("unrealized PnL"), "{}", reason(&r));
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+    let limits = call(&f.app, "limits", json!({})).await;
+    assert_eq!(limits["isError"], false, "{limits}");
+    let hl = &limits["structuredContent"]["hyperliquid"];
+    assert!(hl["equity"].is_null(), "{hl}");
+    assert!(hl["equity_error"].as_str().unwrap().contains("unrealized PnL"), "{hl}");
+    // The saved peak is still reported. The read is not treated as zero, so this is not a breach.
+    assert_eq!(hl["peak_equity"], "10000");
+    assert_eq!(hl["breached"], false);
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+
+    {
+        let mut v = f.venue.lock().unwrap();
+        v.abstraction = json!("default");
+        v.account_value = "nope".into();
+    }
+    assert_eq!(code(&call(&f.app, "hl_place_order", buy("0.1", "2500")).await), "VENUE_UNAVAILABLE");
+    assert_eq!(std::fs::read(equity_file(&f)).unwrap(), before);
+    assert_eq!(call(&f.app, "hl_cancel", json!({"coin": "ETH", "oid": 3})).await["isError"], false);
 }
 
 #[test]

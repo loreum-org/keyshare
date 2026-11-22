@@ -255,18 +255,32 @@ impl KeyshareServer {
         .await
     }
 
-    #[tool(description = "This bot's caps and how much of today's cap it has used. Use it to self-limit.")]
+    #[tool(
+        description = "This bot's caps and how much of today's cap it has used. When Hyperliquid is enabled, also the equity floor: floor, peak equity, current equity, headroom and whether a breach is latched. Use it to self-limit."
+    )]
     async fn limits(&self, Extension(parts): Extension<http::request::Parts>) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
-        self.with_wallet(move |w| match w.limits(&caller) {
-            Ok(limits) => {
-                let mut v = json!(limits);
-                v["spent_24h_usd"] = json!(usd(w.spent_24h(&caller, now())));
-                CallToolResult::structured(v)
-            }
-            Err(r) => refused("", r),
-        })
-        .await
+        let bot = caller.clone();
+        let report = self
+            .with_wallet(move |w| match w.limits(&caller) {
+                Ok(limits) => {
+                    let mut v = json!(limits);
+                    v["spent_24h_usd"] = json!(usd(w.spent_24h(&caller, now())));
+                    Ok(v)
+                }
+                Err(r) => Err(r),
+            })
+            .await?;
+        let mut v = match report {
+            Ok(v) => v,
+            Err(r) => return Ok(refused("", r)),
+        };
+        if let Some(hl) = self.exec.hl.as_deref()
+            && let Some(floor) = hl.floor_for_limits(&self.exec, &bot).await
+        {
+            v["hyperliquid"] = floor;
+        }
+        Ok(CallToolResult::structured(v))
     }
 
     #[tool(description = "Native and priced-token balances of this bot's wallet.")]
@@ -493,7 +507,7 @@ impl KeyshareServer {
     }
 
     #[tool(
-        description = "Hyperliquid testnet: positions, margin and open orders of this bot's account. account.equity is the figure the daily loss stop uses."
+        description = "Hyperliquid testnet: positions, margin and open orders of this bot's account. account.equity is current equity (the daily loss stop and the equity floor). account also reports floor, peak_equity, headroom and breached."
     )]
     async fn hl_positions(
         &self,
@@ -508,7 +522,7 @@ impl KeyshareServer {
     }
 
     #[tool(
-        description = "Hyperliquid testnet: place a limit or trigger (tp/sl) order. Checked against this bot's markets, size caps and daily loss stop. Sizes and prices are decimal strings."
+        description = "Hyperliquid testnet: place a limit or trigger (tp/sl) order. Checked against this bot's markets, size caps, daily loss stop and equity floor. A latched floor allows only reduce-only orders. Sizes and prices are decimal strings."
     )]
     async fn hl_place_order(
         &self,
@@ -541,7 +555,9 @@ impl KeyshareServer {
         hl.modify(&self.exec, &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
     }
 
-    #[tool(description = "Hyperliquid testnet: cancel a resting order by coin and order id.")]
+    #[tool(
+        description = "Hyperliquid testnet: cancel a resting order by coin and order id. Cancels are still allowed when the equity floor is breached."
+    )]
     async fn hl_cancel(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -556,7 +572,9 @@ impl KeyshareServer {
         hl.cancel(&self.exec, &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
     }
 
-    #[tool(description = "Hyperliquid testnet: set leverage for a coin, up to this bot's maximum.")]
+    #[tool(
+        description = "Hyperliquid testnet: set leverage for a coin, up to this bot's maximum. While the equity floor is breached, an increase is refused and a decrease is still allowed."
+    )]
     async fn hl_set_leverage(
         &self,
         Extension(parts): Extension<http::request::Parts>,

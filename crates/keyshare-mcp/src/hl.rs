@@ -86,6 +86,10 @@ fn day_path(state_dir: &Path, bot: &str) -> PathBuf {
     state_dir.join("hyperliquid").join(format!("{bot}.day.json"))
 }
 
+fn equity_path(state_dir: &Path, bot: &str) -> PathBuf {
+    state_dir.join("hyperliquid").join(format!("{bot}.equity.json"))
+}
+
 /// Account value at the first check of the UTC day, for the daily loss stop.
 /// `basis` records which figure was stored. Files written before unified accounts
 /// have no basis; a value of zero in those files is the perp `accountValue`, which
@@ -315,6 +319,130 @@ fn equity_of(abstraction: &Value, state: &Value, spot: Option<&Value>) -> Result
     Err(venue(format!("unsupported account abstraction {mode}")))
 }
 
+/// High-water mark and latched equity-floor breach, beside the daily baseline.
+#[derive(Debug, Serialize, Deserialize)]
+struct EquityMark {
+    peak: String,
+    breached: bool,
+    /// True once `reset_equity_floor` has been applied. Stays true while the flag stays true,
+    /// so the next restart does not clear a breach that happened after that reset.
+    #[serde(default)]
+    reset_seen: bool,
+}
+
+/// Floor snapshot for `limits`, `hl_positions` and the order check.
+struct FloorView {
+    equity_floor_usd: Option<u64>,
+    max_drawdown_from_peak_usd: Option<u64>,
+    reset_equity_floor: bool,
+    /// Binding floor, `E8`.
+    floor: Option<i128>,
+    /// High-water mark, `E8`.
+    peak: Option<i128>,
+    /// Current equity, `E8`.
+    equity: Option<i128>,
+    /// Venue string for current equity, when the read succeeded.
+    equity_wire: Option<String>,
+    breached: bool,
+    equity_error: Option<String>,
+}
+
+fn e8_json(v: Option<i128>) -> Value {
+    match v {
+        Some(n) => json!(hl::wire_e8(n)),
+        None => Value::Null,
+    }
+}
+
+impl FloorView {
+    fn new(
+        policy: &HlPolicy,
+        floor: Option<i128>,
+        peak: Option<i128>,
+        equity: Option<i128>,
+        equity_wire: Option<String>,
+        breached: bool,
+        equity_error: Option<String>,
+    ) -> Self {
+        Self {
+            equity_floor_usd: policy.equity_floor_usd,
+            max_drawdown_from_peak_usd: policy.max_drawdown_from_peak_usd,
+            reset_equity_floor: policy.reset_equity_floor,
+            floor,
+            peak,
+            equity,
+            equity_wire,
+            breached,
+            equity_error,
+        }
+    }
+
+    fn off(policy: &HlPolicy) -> Self {
+        Self::new(policy, None, None, None, None, false, None)
+    }
+
+    fn measured(policy: &HlPolicy, eq: &Equity, peak: i128, breached: bool) -> Result<Self, Refusal> {
+        let floor = policy.effective_floor_e8(peak).map_err(bad)?;
+        Ok(Self::new(policy, floor, Some(peak), Some(eq.equity), Some(eq.equity_wire.clone()), breached, None))
+    }
+
+    /// Equity could not be read. A saved latch is still a breach. A corrupt file is a breach too,
+    /// so a missing read never looks like a clear account.
+    fn unread(policy: &HlPolicy, peak: Option<i128>, breached: bool, reason: String) -> Self {
+        let floor = match peak {
+            Some(peak) => policy.effective_floor_e8(peak).ok().flatten(),
+            None => policy.equity_floor_usd.and_then(|usd| i128::from(usd).checked_mul(hl::E8)),
+        };
+        Self::new(policy, floor, peak, None, None, breached, Some(reason))
+    }
+
+    fn headroom(&self) -> Option<i128> {
+        self.equity?.checked_sub(self.floor?)
+    }
+
+    fn limits_json(&self) -> Value {
+        let mut v = json!({
+            "equity_floor_usd": self.equity_floor_usd,
+            "max_drawdown_from_peak_usd": self.max_drawdown_from_peak_usd,
+            "reset_equity_floor": self.reset_equity_floor,
+            "floor": e8_json(self.floor),
+            "peak_equity": e8_json(self.peak),
+            "equity": self.equity_wire.clone().map_or(Value::Null, |s| json!(s)),
+            "headroom": e8_json(self.headroom()),
+            "breached": self.breached,
+        });
+        if let Some(err) = &self.equity_error {
+            v["equity_error"] = json!(err);
+        }
+        v
+    }
+
+    fn merge_account(&self, account: &mut Value) {
+        account["floor"] = e8_json(self.floor);
+        account["peak_equity"] = e8_json(self.peak);
+        account["headroom"] = e8_json(self.headroom());
+        account["breached"] = json!(self.breached);
+    }
+}
+
+fn floor_refusal(view: &FloorView) -> Refusal {
+    let equity = view.equity_wire.clone().unwrap_or_else(|| "unknown".to_string());
+    let floor = view.floor.map(hl::wire_e8).unwrap_or_else(|| "unknown".to_string());
+    let peak = view.peak.map(hl::wire_e8).unwrap_or_else(|| "unknown".to_string());
+    let through = view.equity.zip(view.floor).is_some_and(|(equity, floor)| equity <= floor);
+    let state = if through {
+        format!("equity {equity} is at or below the floor {floor} (peak {peak})")
+    } else {
+        format!("equity floor breach is latched (equity {equity}, floor {floor}, peak {peak})")
+    };
+    Refusal::new(
+        RefusalCode::EquityFloorBreached,
+        format!(
+            "{state}; only reduce-only orders are allowed until an operator sets reset_equity_floor and restarts. Keyshare does not flatten the account"
+        ),
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Asset {
     index: u32,
@@ -354,6 +482,8 @@ pub struct Hyperliquid {
     policies: HashMap<String, HlPolicy>,
     /// Nonces are millisecond timestamps, unique per agent (design §8).
     last_nonce: Mutex<u64>,
+    /// Serializes read-modify-write of the equity-floor file. Not held across awaits.
+    equity_lock: Mutex<()>,
     /// Caller-scoped request ids that have reached signing. In memory, like EVM request ids: a
     /// restart forgets them. A second use is refused before the agent signs again.
     used_requests: Mutex<HashSet<String>>,
@@ -369,6 +499,7 @@ impl Hyperliquid {
             state_dir,
             policies,
             last_nonce: Mutex::new(0),
+            equity_lock: Mutex::new(()),
             used_requests: Mutex::new(HashSet::new()),
             meta: tokio::sync::Mutex::new(None),
         }
@@ -568,6 +699,117 @@ impl Hyperliquid {
         Ok(start - eq.equity)
     }
 
+    fn load_mark(&self, bot: &str) -> Result<Option<EquityMark>, Refusal> {
+        match std::fs::read_to_string(equity_path(&self.state_dir, bot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(bad(e.to_string())),
+            Ok(text) if text.trim().is_empty() => Err(bad("equity floor state is empty")),
+            Ok(text) => {
+                let rec: EquityMark =
+                    serde_json::from_str(&text).map_err(|_| bad("equity floor state is unreadable"))?;
+                hl::parse_e8(&rec.peak).map_err(|_| bad("equity floor state is unreadable"))?;
+                Ok(Some(rec))
+            }
+        }
+    }
+
+    fn store_mark(&self, bot: &str, rec: &EquityMark) -> Result<(), Refusal> {
+        let path = equity_path(&self.state_dir, bot);
+        let text = serde_json::to_vec(rec).map_err(|e| bad(e.to_string()))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| bad(e.to_string()))?;
+        }
+        keyshare_core::spend::write_atomic(&path, &text).map_err(|e| bad(e.to_string()))
+    }
+
+    /// Updates the high-water mark and the breach latch from one equity read.
+    /// Neither limit configured: no file is written and the account is not breached.
+    /// The mark only rises, and only while the breach is not latched. A reset clears the
+    /// latch once; if equity is still through the floor the same read latches it again.
+    /// The mark is not lowered. This does not place an order.
+    fn observe_floor(&self, bot: &str, eq: &Equity) -> Result<FloorView, Refusal> {
+        let policy = self.policy(bot)?.clone();
+        if !policy.equity_floor_enabled() {
+            return Ok(FloorView::off(&policy));
+        }
+        let _lock = self.equity_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let loaded = self.load_mark(bot)?;
+        let mut changed = loaded.is_none();
+        let mut rec = loaded.unwrap_or(EquityMark { peak: hl::wire_e8(eq.equity), breached: false, reset_seen: false });
+        if policy.reset_equity_floor && !rec.reset_seen {
+            rec.breached = false;
+            rec.reset_seen = true;
+            changed = true;
+        } else if !policy.reset_equity_floor && rec.reset_seen {
+            rec.reset_seen = false;
+            changed = true;
+        }
+        let mut peak = hl::parse_e8(&rec.peak).map_err(|_| bad("equity floor state is unreadable"))?;
+        if !rec.breached && eq.equity > peak {
+            peak = eq.equity;
+            rec.peak = hl::wire_e8(peak);
+            changed = true;
+        }
+        if policy.equity_floor_live(eq.equity, peak).map_err(bad)? && !rec.breached {
+            rec.breached = true;
+            changed = true;
+        }
+        if changed {
+            self.store_mark(bot, &rec)?;
+        }
+        FloorView::measured(&policy, eq, peak, rec.breached)
+    }
+
+    fn unread_view(&self, policy: &HlPolicy, bot: &str, reason: String) -> FloorView {
+        let (peak, breached) = match self.load_mark(bot) {
+            Ok(Some(rec)) => match hl::parse_e8(&rec.peak) {
+                Ok(peak) => (Some(peak), rec.breached),
+                Err(_) => (None, true),
+            },
+            Ok(None) => (None, false),
+            Err(_) => (None, true),
+        };
+        FloorView::unread(policy, peak, breached, reason)
+    }
+
+    /// Floor block for the `limits` tool. `None` when this bot has no Hyperliquid policy.
+    /// A failed equity read is reported, not treated as zero, and does not fail the rest of `limits`.
+    pub async fn floor_for_limits(&self, exec: &Executor, bot: &str) -> Option<Value> {
+        let policy = self.policies.get(bot)?.clone();
+        if !policy.equity_floor_enabled() {
+            return Some(FloorView::off(&policy).limits_json());
+        }
+        let b = bot.to_string();
+        let master = match exec.with_wallet(move |w| w.address(&b)).await {
+            Ok(Ok(address)) => address,
+            Ok(Err(r)) => return Some(self.unread_view(&policy, bot, r.reason).limits_json()),
+            Err(e) => return Some(self.unread_view(&policy, bot, e).limits_json()),
+        };
+        Some(match self.equity(master).await {
+            Ok((_, eq)) => match self.observe_floor(bot, &eq) {
+                Ok(view) => view.limits_json(),
+                Err(r) => self.unread_view(&policy, bot, r.reason).limits_json(),
+            },
+            Err(r) => self.unread_view(&policy, bot, r.reason).limits_json(),
+        })
+    }
+
+    /// An increase is new risk, so it needs a fresh equity read that is not breached.
+    /// A decrease, or the same leverage again, is allowed even when the floor is latched
+    /// or the equity read fails.
+    async fn guard_leverage(&self, bot: &str, master: Address, coin: &str, leverage: u32) -> Result<(), Refusal> {
+        if !self.policy(bot)?.equity_floor_enabled() {
+            return Ok(());
+        }
+        let current = self.leverage(master, coin).await?;
+        if leverage <= current {
+            return Ok(());
+        }
+        let (_, eq) = self.equity(master).await?;
+        let view = self.observe_floor(bot, &eq)?;
+        if view.breached { Err(floor_refusal(&view)) } else { Ok(()) }
+    }
+
     /// Builds the wire order after every guardrail passes.
     async fn checked_order(&self, bot: &str, master: Address, o: &OrderSpec) -> Result<OrderWire, Refusal> {
         let policy = self.policy(bot)?;
@@ -583,14 +825,25 @@ impl Hyperliquid {
         if hl::decimals(&s) > asset.sz_decimals {
             return Err(bad_args(format!("{} sizes have at most {} decimals", o.coin, asset.sz_decimals)));
         }
-        // Reading equity also sets the day's loss baseline. A reduce-only order only shrinks
-        // risk, so a failed read or baseline write never blocks it.
+        // Reading equity also sets the day's loss baseline and the equity-floor mark.
+        // A reduce-only order only shrinks risk, so a failed read never blocks it, and the
+        // floor is not applied to it. Keyshare does not flatten; the caller sends that order.
         let read = async {
             let (_, eq) = self.equity(master).await?;
             let szi = eq.szi(&o.coin);
-            Ok::<_, Refusal>((szi, self.loss_today(bot, &eq)?))
+            let loss = self.loss_today(bot, &eq)?;
+            let floor = self.observe_floor(bot, &eq)?;
+            Ok::<_, Refusal>((szi, loss, floor))
         };
-        let (szi, loss) = if o.reduce_only { read.await.unwrap_or((0, 0)) } else { read.await? };
+        let (szi, loss) = if o.reduce_only {
+            read.await.map(|(szi, loss, _)| (szi, loss)).unwrap_or((0, 0))
+        } else {
+            let (szi, loss, floor) = read.await?;
+            if floor.breached {
+                return Err(floor_refusal(&floor));
+            }
+            (szi, loss)
+        };
         let (value_px, position_after, leverage) = if o.reduce_only {
             (px, 0, 0)
         } else {
@@ -756,9 +1009,11 @@ impl Hyperliquid {
         is_cross: bool,
     ) -> Result<Outcome, String> {
         let checked = async {
-            self.master(exec, bot).await?;
+            let master = self.master(exec, bot).await?;
             self.policy(bot)?.check_leverage(coin, leverage)?;
-            self.asset(coin).await
+            let asset = self.asset(coin).await?;
+            self.guard_leverage(bot, master, coin, leverage).await?;
+            Ok(asset)
         };
         match checked.await {
             Ok(a) => self.send(exec, bot, id, L1Action::update_leverage(a.index, is_cross, leverage)).await,
@@ -778,12 +1033,14 @@ impl Hyperliquid {
             let (state, eq) = self.equity(master).await?;
             // A read sets the day's loss baseline too, so overnight losses count from the first look.
             self.loss_today(bot, &eq)?;
+            let mut account = eq.report();
+            self.observe_floor(bot, &eq)?.merge_account(&mut account);
             let orders = self.info(json!({"type": "openOrders", "user": master})).await?;
             Ok::<_, Refusal>(json!({
                 "master": master,
                 "state": state,
                 "open_orders": orders,
-                "account": eq.report(),
+                "account": account,
             }))
         };
         run.await.map_err(|r| refusal_json("", &r))
@@ -1011,5 +1268,94 @@ mod equity_tests {
         let eq = unified("-10.0", json!([]));
         assert_eq!(eq.equity, hl::parse_e8("-10.0").unwrap());
         assert!(!eq.repair_legacy_zero);
+    }
+
+    fn floor_policy(floor: Option<u64>, drawdown: Option<u64>, reset: bool) -> hl::HlPolicy {
+        hl::HlPolicy {
+            markets: vec!["ETH".into()],
+            max_order_usd: 1_000,
+            max_position_usd: 2_000,
+            max_leverage: 5,
+            daily_loss_stop_usd: 100,
+            equity_floor_usd: floor,
+            max_drawdown_from_peak_usd: drawdown,
+            reset_equity_floor: reset,
+        }
+    }
+
+    fn open_hl(dir: &std::path::Path, policy: hl::HlPolicy) -> Hyperliquid {
+        let mut policies = std::collections::HashMap::new();
+        policies.insert("filltape".into(), policy);
+        Hyperliquid::new(None, dir.to_path_buf(), policies)
+    }
+
+    fn standard_eq(account: &str) -> Equity {
+        equity_of(&json!("default"), &state(account, json!([])), None).unwrap()
+    }
+
+    #[test]
+    fn peak_and_latch_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        // Standard account: the first read sets the peak. 1000 is above the absolute floor.
+        // The trailing floor is 900, so that is the binding floor.
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), false));
+        let view = hl.observe_floor("filltape", &standard_eq("1000")).unwrap();
+        assert!(!view.breached);
+        assert_eq!(view.peak, Some(hl::parse_e8("1000").unwrap()));
+        assert_eq!(view.floor, Some(hl::parse_e8("900").unwrap()));
+        assert_eq!(view.headroom(), Some(hl::parse_e8("100").unwrap()));
+
+        // A new process, now reading unified equity of exactly the trailing floor.
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), false));
+        let view = hl.observe_floor("filltape", &unified("900.0", json!([]))).unwrap();
+        assert!(view.breached);
+        assert_eq!(view.equity_wire.as_deref(), Some("900.0"));
+        assert_eq!(view.peak, Some(hl::parse_e8("1000").unwrap()));
+        let reason = floor_refusal(&view).reason;
+        assert!(reason.contains("equity 900.0"), "{reason}");
+        assert!(reason.contains("floor 900"), "{reason}");
+        assert_eq!(floor_refusal(&view).code, RefusalCode::EquityFloorBreached);
+
+        // A bounce past the old peak does not clear the latch or raise the mark.
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), false));
+        let view = hl.observe_floor("filltape", &unified("1100.0", json!([]))).unwrap();
+        assert!(view.breached);
+        assert_eq!(view.peak, Some(hl::parse_e8("1000").unwrap()));
+        let reason = floor_refusal(&view).reason;
+        assert!(reason.contains("latched"), "{reason}");
+        assert!(reason.contains("equity 1100.0"), "{reason}");
+        assert!(reason.contains("floor 900"), "{reason}");
+        assert!(reason.contains("does not flatten"), "{reason}");
+
+        // Reset inside the band clears once. The mark then rises to the new equity.
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), true));
+        let view = hl.observe_floor("filltape", &standard_eq("1100")).unwrap();
+        assert!(!view.breached);
+        assert_eq!(view.peak, Some(hl::parse_e8("1100").unwrap()));
+
+        // The flag is spent. A later breach stays latched on the next process even though
+        // the flag is still true, including after equity recovers.
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), true));
+        assert!(hl.observe_floor("filltape", &unified("1000.0", json!([]))).unwrap().breached);
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), true));
+        let view = hl.observe_floor("filltape", &unified("1100.0", json!([]))).unwrap();
+        assert!(view.breached);
+        assert_eq!(view.peak, Some(hl::parse_e8("1100").unwrap()));
+
+        // Toggle the flag off, then on. Equity 1050 is inside the trailing band (floor 1000).
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), false));
+        assert!(hl.observe_floor("filltape", &standard_eq("1050")).unwrap().breached);
+        let hl = open_hl(dir.path(), floor_policy(Some(800), Some(100), true));
+        let view = hl.observe_floor("filltape", &standard_eq("1050")).unwrap();
+        assert!(!view.breached);
+        assert_eq!(view.peak, Some(hl::parse_e8("1100").unwrap()));
+
+        // Unset limits do not write a mark and do not enforce a file left from earlier.
+        let idle = tempfile::tempdir().unwrap();
+        let hl = open_hl(idle.path(), floor_policy(None, None, false));
+        let view = hl.observe_floor("filltape", &standard_eq("1")).unwrap();
+        assert!(!view.breached);
+        assert!(view.floor.is_none());
+        assert!(!equity_path(idle.path(), "filltape").exists());
     }
 }

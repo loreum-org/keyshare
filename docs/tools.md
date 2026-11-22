@@ -15,7 +15,7 @@ The exception is a request that was held for the owner and then expired. Its id 
 | Tool | Inputs | Returns |
 |---|---|---|
 | `address` | none | The bot's wallet address and the chains it may use. |
-| `limits` | none | The bot's caps, how much of the rolling 24-hour cap it has used, and how many recipients, contracts and typed-data rules it has. Use this to self-limit. |
+| `limits` | none | The bot's caps, how much of the rolling 24-hour cap it has used, and how many recipients, contracts and typed-data rules it has. When the bot has a Hyperliquid section, `hyperliquid` adds the equity floor: `floor`, `peak_equity`, `equity` (current equity), `headroom` and `breached`. Use this to self-limit. |
 | `balances` | `chain_id` (optional) | Native and priced-token balances, on one chain or all configured chains. |
 | `tx_status` | `chain_id`, and `tx_hash` or `request_id` | One of `pending_user_approval`, `executing`, `refused`, `pending`, `confirmed`, `failed`, `unknown`. |
 | `simulate` | `chain_id`, `to`, `data` (optional), `value_wei` (optional) | The policy verdict, the gas estimate, and whether the call reverts. Nothing is signed or recorded. |
@@ -45,11 +45,11 @@ Only for bots with a `hyperliquid` section in the config. See [Hyperliquid](hype
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `hl_positions` | none | Positions, margin and open orders. `account.equity` is the figure the daily loss stop uses; `account.available_margin` is free margin when the venue reports it. |
+| `hl_positions` | none | Positions, margin and open orders. `account.equity` is current equity, the figure the daily loss stop and the equity floor use. `account.floor`, `account.peak_equity`, `account.headroom` and `account.breached` are the floor state. `account.available_margin` is free margin when the venue reports it. |
 | `hl_place_order` | `order` | Places a limit order, or a take-profit / stop-loss trigger order. |
 | `hl_modify` | `oid`, `order` | Replaces a resting order. The new order is checked like a new one. |
 | `hl_cancel` | `coin`, `oid` | Cancels a resting order. |
-| `hl_set_leverage` | `coin`, `leverage`, `is_cross` (default true) | Sets leverage for a coin, up to the bot's maximum. |
+| `hl_set_leverage` | `coin`, `leverage`, `is_cross` (default true) | Sets leverage for a coin, up to the bot's maximum. While the equity floor is breached, an increase is refused and a decrease is still allowed. |
 
 An `order` has: `coin` (e.g. `"ETH"`), `is_buy`, `sz` (size in coins), `limit_px`, `tif` (`Gtc`, `Ioc` or `Alo`; default `Gtc`), `reduce_only`, and optionally `cloid`. For a trigger order add `trigger_px`, `tpsl` (`tp` or `sl`) and `trigger_is_market` (default true).
 
@@ -86,6 +86,7 @@ A refused call returns `refused: true`, a `code`, a plain `reason`, and the `req
 | `POSITION_TOO_LARGE` | The order would take the position over the bot's limit. |
 | `LEVERAGE_TOO_HIGH` | Over the bot's leverage limit. |
 | `DAILY_LOSS_STOP` | The account hit its daily loss stop; only reducing orders are allowed. |
+| `EQUITY_FLOOR_BREACHED` | Equity is at or below the floor, or that breach is still latched. The reason names the equity and the floor. Only reduce-only orders are allowed until an operator sets `reset_equity_floor` and restarts. Keyshare does not flatten the account. |
 | `NO_AGENT_KEY` | The bot has no valid Hyperliquid agent key. The owner needs to run `hl-approve-agent`. |
 | `VENUE_UNAVAILABLE` | Hyperliquid didn't answer or rejected the request. |
 | `BAD_ARGS` | The inputs don't make sense (bad amount, unknown option). |

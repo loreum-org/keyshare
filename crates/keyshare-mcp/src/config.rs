@@ -193,8 +193,12 @@ impl Config {
 
     pub fn hyperliquid(&self) -> Result<Hyperliquid, ConfigError> {
         crate::hl::check_api_url(self.hyperliquid.as_ref()).map_err(ConfigError::Other)?;
-        let policies =
-            self.bots.iter().filter_map(|(bot, cfg)| Some((bot.clone(), cfg.hyperliquid.clone()?))).collect();
+        let mut policies = HashMap::new();
+        for (bot, cfg) in &self.bots {
+            let Some(policy) = cfg.hyperliquid.clone() else { continue };
+            policy.validate().map_err(|e| ConfigError::Other(format!("bot {bot}: {e}")))?;
+            policies.insert(bot.clone(), policy);
+        }
         Ok(Hyperliquid::new(self.hyperliquid.as_ref(), self.server.state_dir.clone(), policies))
     }
 }
@@ -248,7 +252,7 @@ mod tests {
     #[test]
     fn railway_example_is_testnet_with_runtime_hosts() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../keyshare.railway.example.toml");
-        let config = Config::load(&path).unwrap();
+        let mut config = Config::load(&path).unwrap();
         assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.server.state_dir, PathBuf::from("/data"));
         assert!(config.server.allowed_hosts.is_empty());
@@ -260,11 +264,28 @@ mod tests {
         );
         assert!(config.hyperliquid.is_none());
         assert_eq!(config.chains[0].id, 11155111);
-        let bot = config.bots.get("filltape").unwrap();
-        assert_eq!(bot.credential_sha256, B256::ZERO);
-        assert_eq!(bot.key_env, "FILLTAPE_KEY");
-        assert_eq!(bot.policy.chains, vec![11155111]);
-        let hl = bot.hyperliquid.as_ref().unwrap();
-        assert_eq!(hl.markets, vec!["ETH".to_string(), "BTC".to_string()]);
+        {
+            let bot = config.bots.get("filltape").unwrap();
+            assert_eq!(bot.credential_sha256, B256::ZERO);
+            assert_eq!(bot.key_env, "FILLTAPE_KEY");
+            assert_eq!(bot.policy.chains, vec![11155111]);
+            let hl = bot.hyperliquid.as_ref().unwrap();
+            assert_eq!(hl.markets, vec!["ETH".to_string(), "BTC".to_string()]);
+            assert!(!hl.equity_floor_enabled());
+        }
+        assert!(config.hyperliquid().is_ok());
+
+        {
+            let hl = config.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
+            hl.equity_floor_usd = Some(0);
+        }
+        let err = config.hyperliquid().err().unwrap().to_string();
+        assert!(err.contains("filltape") && err.contains("positive"), "{err}");
+        {
+            let hl = config.bots.get_mut("filltape").unwrap().hyperliquid.as_mut().unwrap();
+            hl.equity_floor_usd = Some(500);
+            hl.max_drawdown_from_peak_usd = Some(100);
+        }
+        assert!(config.hyperliquid().is_ok());
     }
 }

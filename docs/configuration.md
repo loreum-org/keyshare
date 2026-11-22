@@ -108,3 +108,6 @@ Without this section the bot can't use the Hyperliquid tools. [Hyperliquid](hype
 | `max_position_usd` | Largest position in one coin after the order and the bot's other open orders on that side fill. |
 | `max_leverage` | Highest leverage the bot may set or trade at. |
 | `daily_loss_stop_usd` | Once the account is down this much since its first check of the UTC day, only orders that reduce positions are allowed. |
+| `equity_floor_usd` | Optional. Positive whole USD, at most 1_000_000_000_000. At or below this equity, new risk is refused until `reset_equity_floor`. Unset means no absolute floor. |
+| `max_drawdown_from_peak_usd` | Optional. Same bounds. New risk stops this far below the persisted high-water mark. Unset means no trailing floor. |
+| `reset_equity_floor` | Optional, default false. Set `true` and restart to clear a latched equity-floor breach once. Set it back to `false` afterward. It does not lower the high-water mark and it does not flatten the account. |

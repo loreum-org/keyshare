@@ -30,8 +30,29 @@ Set per bot in `[bots.<name>.hyperliquid]`. Without that section the bot can't u
 | `max_position_usd` | The position after this order fills, plus the bot's other open orders on the same side, must stay under this. |
 | `max_leverage` | `hl_set_leverage` can't go above it, and a new order is refused if the coin's current leverage is above it. |
 | `daily_loss_stop_usd` | Keyshare records equity the first time it checks the account each UTC day. Once the account is down this much from there, new orders that add risk are refused. |
+| `equity_floor_usd` | Absolute floor in whole USD. Optional. At or below it, new risk is refused and the breach latches. |
+| `max_drawdown_from_peak_usd` | Trailing floor in whole USD below the high-water mark. Optional. Reaching it latches the same way. |
+| `reset_equity_floor` | Set `true` and restart to clear a latched breach once. Then set it back to `false`. |
 
-**Reduce-only orders skip the size, position, leverage and loss checks.** They can only shrink a position, and Hyperliquid enforces that, so a bot can always close out even after hitting a limit or if the account check fails.
+**Reduce-only orders skip the size, position, leverage, loss and equity-floor checks.** They can only shrink a position, and Hyperliquid enforces that, so a bot can always close out even after hitting a limit or if the account check fails. Cancels are allowed too. `hl_set_leverage` can still lower leverage while the floor is latched; it cannot raise it.
+
+## Equity floor
+
+The floor protects principal. It sits beside the daily loss stop and uses the same equity figure. Leave both `equity_floor_usd` and `max_drawdown_from_peak_usd` unset and nothing here changes.
+
+When both are set, the binding floor is the higher of the absolute floor and (peak − drawdown). Equity at or below that floor is a breach. A drawdown of exactly the limit is a breach.
+
+The high-water mark is the highest equity Keyshare has read while the account was not latched. It is stored in `hyperliquid/<bot>.equity.json`, the same way the daily baseline is stored in `<bot>.day.json`. The mark only moves up. Deposits raise it. Withdrawals do not lower it, so taking cash out can trip the trailing floor. It survives restarts.
+
+A breach **latches**. `hl_place_order` then refuses every order that is not reduce-only, with `EQUITY_FLOOR_BREACHED`. The reason includes the equity and the floor. `hl_modify` is checked like a new order. `hl_set_leverage` refuses an increase. Reduce-only orders, including reduce-only take-profit and stop-loss orders, and `hl_cancel` still work.
+
+The latch stays after equity recovers, after the floor numbers are edited, and across restarts. Clearing it takes `reset_equity_floor = true` and a restart. That flag is consumed on the next successful equity read: the latch is cleared, and if equity is still at or below the floor it latches again on that same read. The high-water mark is not lowered. Leaving the flag `true` does not clear a later breach; set it back to `false`, then to `true` again, when you mean to clear. Removing both limits turns the check off. Putting them back without a reset enforces a latch that was already on disk.
+
+If equity cannot be read, or the account mode is one this server does not price, new risk is refused (`VENUE_UNAVAILABLE`). A missing read is not treated as zero and is not written as a peak.
+
+Keyshare does not flatten the account. There is no close-all inside the server. The caller closes risk with reduce-only orders.
+
+`limits` (under `hyperliquid`) and `hl_positions` (under `account`) report `floor`, `peak_equity`, current equity (`equity`), `headroom`, and `breached`. `headroom` is equity minus the binding floor. `limits` does not query the venue when both limits are unset.
 
 ## Unified accounts
 
@@ -43,7 +64,7 @@ Set per bot in `[bots.<name>.hyperliquid]`. Without that section the bot can't u
 | `unifiedAccount` | Spot USDC (token 0) `total`, plus unrealized PnL on the default perp dex. Perp `accountValue` is not added. | `tokenToAvailableAfterMaintenance` for token 0. |
 | `portfolioMargin` | Not computed. Other collateral is not priced, so new risk is refused. | |
 
-On a unified account the spot clearinghouse is the balance. USDC `total` is cash, not a sum of every spot token. A non-zero non-USDC balance or hold, a missing USDC row, a missing or unreadable available-margin entry, an available figure above the USDC balance, or a position whose unrealized PnL is missing all refuse new risk instead of counting as zero. `hl_positions` reports this under `account`: `abstraction`, `equity`, `equity_source`, `usdc_total`, `unrealized_pnl`, `available_margin`, `available_source`. The last two are omitted for a standard account when `withdrawable` is absent.
+On a unified account the spot clearinghouse is the balance. USDC `total` is cash, not a sum of every spot token. A non-zero non-USDC balance or hold, a missing USDC row, a missing or unreadable available-margin entry, an available figure above the USDC balance, or a position whose unrealized PnL is missing all refuse new risk instead of counting as zero. `hl_positions` reports this under `account`: `abstraction`, `equity`, `equity_source`, `usdc_total`, `unrealized_pnl`, `available_margin`, `available_source`, plus the equity-floor fields `floor`, `peak_equity`, `headroom` and `breached`. The available-margin fields are omitted for a standard account when `withdrawable` is absent. `floor`, `peak_equity` and `headroom` are null when no equity floor is configured.
 
 A same-day baseline of exactly 0 with no `basis` is the old perp reading. It is replaced with unified equity only when that account is flat: no position size and no USDC hold. An open position or a hold leaves the zero in place and refuses new risk. Any other saved baseline is left as it is, including a real zero on a standard account and a non-zero figure.
 
@@ -60,6 +81,7 @@ Each Hyperliquid action takes an optional request id, used once like the chain t
 ## Known gaps
 
 - The loss stop starts from the first check of the day, not from midnight. A loss before that first check isn't counted.
-- Deposits and withdrawals during the day move the account value and so move the loss stop too.
+- Deposits and withdrawals during the day move the account value and so move the loss stop too. A deposit also raises the equity-floor high-water mark. A withdrawal does not lower it.
+- Only the default perp dex is in the equity figure, so a HIP-3 position is invisible to the floor, same as the loss stop.
 - The agent key file is plain text, protected only by file permissions.
 - Request ids are kept in memory and forgotten on restart.

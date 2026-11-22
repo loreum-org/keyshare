@@ -36,6 +36,9 @@ pub enum RefusalCode {
     PositionTooLarge,
     LeverageTooHigh,
     DailyLossStop,
+    /// Hyperliquid: equity is at or below the account floor, or that breach is still latched.
+    /// Not owner-approvable. The server does not flatten; the caller sends reduce-only orders.
+    EquityFloorBreached,
     /// Hyperliquid: no approved, unexpired agent key for this bot.
     NoAgentKey,
     /// Hyperliquid API unreachable or returned something unreadable.

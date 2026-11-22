@@ -86,10 +86,13 @@ chains = [11155111]
 
 # Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
 # agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
-# the size caps and the loss stop.
+# the size caps, the loss stop and the equity floor. Keyshare does not flatten a breached account.
 [bots.filltape.hyperliquid]
 markets = ["ETH", "BTC"]
 max_order_usd = 1000           # size x limit price
 max_position_usd = 2000        # per coin, after the order fills
 max_leverage = 5
 daily_loss_stop_usd = 100      # vs account value at the first order of the UTC day
+# equity_floor_usd = 500       # absolute floor. At or below it, only reduce risk. Unset = off.
+# max_drawdown_from_peak_usd = 200  # trailing floor, this far below the high-water mark. Unset = off.
+# reset_equity_floor = false    # set true and restart once to clear a latched breach, then set it back to false
