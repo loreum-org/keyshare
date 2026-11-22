@@ -22,6 +22,7 @@ use keyshare_signer::threshold::{
 
 const CHAIN: u64 = 11155111;
 const OWNER: Address = address!("0x1111111111111111111111111111111111111111");
+const EXCHANGE: Address = address!("0x3333333333333333333333333333333333333333");
 const NOW: u64 = 1_800_000_000;
 const BOT: &str = "bot";
 
@@ -37,6 +38,9 @@ fn policy(per_tx: u64, daily: u64) -> PlainPolicy {
         per_tx_cap_usd = {per_tx}
         daily_cap_usd = {daily}
         recipients_allow = ["{OWNER}"]
+        [[typed_data_allow]]
+        primary_type = "Order"
+        verifying_contract = "{EXCHANGE}"
         "#
     ))
     .unwrap()
@@ -121,6 +125,20 @@ fn signs_only_with_both_shares_and_signatures_recover() {
 
     let sig = w.sign_message(BOT, "m", b"hello", NOW).unwrap();
     assert_eq!(sig.recover_address_from_prehash(&eip191_hash_message(b"hello")).unwrap(), bot.address());
+
+    let order: alloy::dyn_abi::TypedData = serde_json::from_value(serde_json::json!({
+        "types": {
+            "EIP712Domain": [{"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
+            "Order": [{"name": "amount", "type": "uint256"}]
+        },
+        "primaryType": "Order",
+        "domain": {"chainId": CHAIN, "verifyingContract": EXCHANGE},
+        "message": {"amount": "1"}
+    }))
+    .unwrap();
+    let sig = w.sign_typed_data(BOT, "t", &order, NOW).unwrap();
+    let hash = order.eip712_signing_hash().unwrap();
+    assert_eq!(sig.recover_address_from_prehash(&hash).unwrap(), bot.address());
 
     // Each share is built for exactly one role.
     assert!(ThresholdSigner::new(co.clone(), cosigner(co, dir.path(), 1, 1, 1, &[])).is_err());
