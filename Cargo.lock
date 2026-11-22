@@ -3209,6 +3209,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "keyshare-core",
+ "keyshare-module",
  "reqwest 0.13.5",
  "rmcp",
  "rmp-serde",

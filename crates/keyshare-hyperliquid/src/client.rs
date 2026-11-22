@@ -19,7 +19,8 @@ use alloy::dyn_abi::TypedData;
 use alloy::primitives::{Address, B256, Signature};
 use keyshare_core::audit::AuditEvent;
 use keyshare_core::killswitch::KillSwitch;
-use keyshare_core::{LocalSigner, Refusal, RefusalCode, Signer, Wallet};
+use keyshare_core::{LocalSigner, Refusal, RefusalCode, Signer};
+use keyshare_module::ModuleView;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,15 +36,10 @@ fn scoped_id(bot: &str, id: &str) -> String {
     format!("{bot}:{id}")
 }
 
-/// What the connector core provides. [`HlHost::sign_l1`] is the only way an L1 action becomes a
-/// signature, and the core re-checks the action before it signs. This crate does not sign the
-/// bot's wallet key.
-pub trait HlHost: Send + Sync {
-    fn with_wallet<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
-    ) -> impl Future<Output = Result<T, String>> + Send;
-
+/// What the connector core provides. [`ModuleView`] is reads and audit writes. [`HlHost::sign_l1`]
+/// is the only way an L1 action becomes a signature, and the core re-checks the action before it
+/// signs. This crate does not sign the bot's wallet key.
+pub trait HlHost: ModuleView {
     fn sign_l1(
         &self,
         bot: &str,
@@ -60,6 +56,12 @@ pub const HYPERLIQUID_TOOLS: &[&str] = &["hl_positions", "hl_place_order", "hl_m
 const MAINNET: bool = false;
 /// An agent this close to expiry is treated as expired, so an order never races the cutoff.
 const EXPIRY_MARGIN_MS: u64 = 60_000;
+
+/// Whether the connector should refuse to load this agent key. The margin is part of the venue
+/// rule; the connector owns the file and the key bytes.
+pub fn agent_expired(valid_until_ms: u64, now_ms: u64) -> bool {
+    valid_until_ms <= now_ms.saturating_add(EXPIRY_MARGIN_MS)
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -599,36 +601,16 @@ impl Hyperliquid {
         meta.as_ref().and_then(|m| m.iter().find(|(_, asset)| asset.index == index).map(|(name, _)| name.clone()))
     }
 
-    /// The agent key, for the core to sign with. Modules call [`HlHost::sign_l1`] instead.
-    pub fn open_agent(&self, bot: &str) -> Result<LocalSigner, Refusal> {
-        let none = |why: &str| {
-            Refusal::new(
-                RefusalCode::NoAgentKey,
-                format!("{why}; the owner runs `keyshare-mcp hl-approve-agent <config> {bot}`"),
-            )
-        };
-        let text = std::fs::read_to_string(agent_path(&self.state_dir, bot)).map_err(|_| none("no agent key"))?;
-        let file: AgentFile = serde_json::from_str(&text).map_err(|_| none("agent key file is unreadable"))?;
-        if file.valid_until_ms <= now_ms() + EXPIRY_MARGIN_MS {
-            return Err(none("agent key has expired"));
-        }
-        let signer = LocalSigner::from_hex(&file.key).map_err(|_| none("agent key file is unreadable"))?;
-        if signer.address() != file.address {
-            return Err(none("agent key does not match its address"));
-        }
-        Ok(signer)
+    /// Where the connector stores this bot's agent key. The module does not read that file.
+    pub fn agent_path_for(&self, bot: &str) -> PathBuf {
+        agent_path(&self.state_dir, bot)
     }
 
     /// Master address (queries use it, not the agent's) after the kill switch.
     async fn master(&self, exec: &impl HlHost, bot: &str) -> Result<Address, Refusal> {
-        let b = bot.to_string();
-        exec.with_wallet(move |w| {
-            let a = w.address(&b)?;
-            w.kill_switch().check(&b)?;
-            Ok(a)
-        })
-        .await
-        .map_err(bad)?
+        let address = exec.address(bot).await?;
+        exec.check_kill_switch(bot).await?;
+        Ok(address)
     }
 
     /// Equity for this master. Standard modes use the perp account value. A unified
@@ -816,11 +798,9 @@ impl Hyperliquid {
         if !policy.equity_floor_enabled() {
             return Some(FloorView::off(&policy).limits_json());
         }
-        let b = bot.to_string();
-        let master = match exec.with_wallet(move |w| w.address(&b)).await {
-            Ok(Ok(address)) => address,
-            Ok(Err(r)) => return Some(self.unread_view(&policy, bot, r.reason).limits_json()),
-            Err(e) => return Some(self.unread_view(&policy, bot, e).limits_json()),
+        let master = match exec.address(bot).await {
+            Ok(address) => address,
+            Err(r) => return Some(self.unread_view(&policy, bot, r.reason).limits_json()),
         };
         Some(match self.equity(master).await {
             Ok((_, eq)) => match self.observe_floor(bot, &eq) {
@@ -935,20 +915,18 @@ impl Hyperliquid {
             return self.refuse(exec, bot, id, detail, r).await;
         }
         // Recheck immediately before signing. `prepare` already checked, then waited on the venue.
-        let b = bot.to_string();
-        match exec.with_wallet(move |w| w.kill_switch().check(&b)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(r)) => {
+        match exec.check_kill_switch(bot).await {
+            Ok(()) => {}
+            Err(r) if r.code == RefusalCode::Internal => {
+                self.release_request(&key);
+                return Err(r.reason);
+            }
+            Err(r) => {
                 self.release_request(&key);
                 return self.refuse(exec, bot, id, detail, r).await;
             }
-            Err(e) => {
-                self.release_request(&key);
-                return Err(e);
-            }
         }
-        let (b, i, d) = (bot.to_string(), id.to_string(), detail.clone());
-        if let Err(e) = exec.with_wallet(move |w| w.log_event(&b, &i, AuditEvent::Requested, d, now_secs())).await {
+        if let Err(e) = exec.log_event(bot, id, AuditEvent::Requested, detail.clone(), now_secs()).await {
             self.release_request(&key);
             return Err(e);
         }
@@ -962,9 +940,7 @@ impl Hyperliquid {
             }
         };
         // Signed from here, whether or not the post lands. The id stays used.
-        let (b, i) = (bot.to_string(), id.to_string());
-        exec.with_wallet(move |w| w.log_event(&b, &i, AuditEvent::Signed, json!({ "nonce": nonce }), now_secs()))
-            .await?;
+        exec.log_event(bot, id, AuditEvent::Signed, json!({ "nonce": nonce }), now_secs()).await?;
         let body = json!({
             "action": action,
             "nonce": nonce,
@@ -989,8 +965,7 @@ impl Hyperliquid {
         detail: Value,
         r: Refusal,
     ) -> Result<Outcome, String> {
-        let (b, i, rr) = (bot.to_string(), id.to_string(), r.clone());
-        exec.with_wallet(move |w| w.log_refusal(&b, &i, detail, &rr, now_secs())).await?;
+        exec.log_refusal(bot, id, detail, &r, now_secs()).await?;
         Ok(Err(refusal_json(id, &r)))
     }
 
@@ -1076,8 +1051,7 @@ impl Hyperliquid {
     /// Positions, margin and open orders of this bot's master account.
     pub async fn positions(&self, exec: &impl HlHost, bot: &str) -> Outcome {
         let run = async {
-            let b = bot.to_string();
-            let master = exec.with_wallet(move |w| w.address(&b)).await.map_err(bad)??;
+            let master = exec.address(bot).await?;
             self.policy(bot)?;
             let (state, eq) = self.equity(master).await?;
             // A read sets the day's loss baseline too, so overnight losses count from the first look.
@@ -1177,6 +1151,61 @@ mod equity_tests {
             "balances": balances,
             "tokenToAvailableAfterMaintenance": [[0, available]],
         })
+    }
+
+    /// A host with no `Wallet` satisfies [`HlHost`]. Adding `with_wallet` (or any method that
+    /// hands the module a signer) breaks this impl.
+    struct BareHost;
+
+    fn bare() -> Refusal {
+        Refusal::new(RefusalCode::Internal, "bare host has no wallet")
+    }
+
+    impl ModuleView for BareHost {
+        async fn address(&self, _: &str) -> Result<Address, Refusal> {
+            Err(bare())
+        }
+        async fn limits(&self, _: &str) -> Result<keyshare_core::policy::Limits, Refusal> {
+            Err(bare())
+        }
+        async fn spent_24h(&self, _: &str, _: u64) -> Result<keyshare_core::price::UsdMicros, Refusal> {
+            Err(bare())
+        }
+        async fn check_kill_switch(&self, _: &str) -> Result<(), Refusal> {
+            Err(bare())
+        }
+        async fn preview_tx(
+            &self,
+            _: &str,
+            _: alloy::consensus::TxEip1559,
+            _: u64,
+        ) -> Result<keyshare_core::policy::Verdict, Refusal> {
+            Err(bare())
+        }
+        async fn log_event(&self, _: &str, _: &str, _: AuditEvent, _: Value, _: u64) -> Result<(), String> {
+            Err("bare host has no wallet".into())
+        }
+        async fn log_refusal(&self, _: &str, _: &str, _: Value, _: &Refusal, _: u64) -> Result<(), String> {
+            Err("bare host has no wallet".into())
+        }
+    }
+
+    impl HlHost for BareHost {
+        async fn sign_l1(
+            &self,
+            _: &str,
+            _: &str,
+            _: &L1Action,
+            _: u64,
+        ) -> Result<alloy::primitives::Signature, Refusal> {
+            Err(bare())
+        }
+    }
+
+    #[test]
+    fn host_trait_does_not_require_a_wallet() {
+        fn assert_host<T: HlHost>() {}
+        assert_host::<BareHost>();
     }
 
     fn state(account_value: &str, positions: Value) -> Value {

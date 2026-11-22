@@ -493,13 +493,13 @@ impl HlPolicy {
     }
 }
 
-/// Asset index carried by an L1 action, when it has one.
-pub fn action_asset(action: &L1Action) -> Option<u32> {
+/// Every asset index an L1 action would sign. Empty when the action names none.
+pub fn action_assets(action: &L1Action) -> Vec<u32> {
     match action {
-        L1Action::Order { orders, .. } => orders.first().map(|o| o.a),
-        L1Action::Cancel { cancels, .. } => cancels.first().map(|c| c.a),
-        L1Action::Modify { modifies, .. } => modifies.first().map(|m| m.order.a),
-        L1Action::UpdateLeverage { asset, .. } => Some(*asset),
+        L1Action::Order { orders, .. } => orders.iter().map(|o| o.a).collect(),
+        L1Action::Cancel { cancels, .. } => cancels.iter().map(|c| c.a).collect(),
+        L1Action::Modify { modifies, .. } => modifies.iter().map(|m| m.order.a).collect(),
+        L1Action::UpdateLeverage { asset, .. } => vec![*asset],
     }
 }
 
@@ -520,6 +520,20 @@ mod tests {
 
     fn rsv(r: &str, s: &str, v: u8) -> serde_json::Value {
         json!({"r": r, "s": s, "v": v})
+    }
+
+    #[test]
+    fn action_assets_covers_every_wire_index() {
+        let one = limit(4, true, "1", "1", Tif::Gtc);
+        let two = limit(9, false, "1", "1", Tif::Gtc);
+        assert_eq!(action_assets(&L1Action::order(vec![one.clone(), two.clone()])), vec![4, 9]);
+        assert!(action_assets(&L1Action::order(vec![])).is_empty());
+        assert_eq!(
+            action_assets(&L1Action::cancel(vec![CancelWire { a: 3, o: 1 }, CancelWire { a: 5, o: 2 }])),
+            vec![3, 5]
+        );
+        assert_eq!(action_assets(&L1Action::modify(vec![ModifyWire { oid: 1, order: one }])), vec![4]);
+        assert_eq!(action_assets(&L1Action::update_leverage(7, true, 2)), vec![7]);
     }
 
     fn limit(a: u32, b: bool, px: &str, sz: &str, tif: Tif) -> OrderWire {

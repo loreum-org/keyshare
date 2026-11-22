@@ -6,6 +6,7 @@ pub mod client;
 pub mod protocol;
 
 pub use client::{
-    AgentFile, HlConfig, HlHost, Hyperliquid, OrderSpec, Outcome, agent_path, approve_agent, check_api_url, now_ms,
+    AgentFile, HlConfig, HlHost, Hyperliquid, OrderSpec, Outcome, agent_expired, agent_path, approve_agent,
+    check_api_url, now_ms,
 };
 pub use protocol::*;

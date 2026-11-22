@@ -4,13 +4,20 @@
 //! It does not receive a signer. [`authorize_tx`] and [`authorize_typed`] run in the core, on the
 //! bytes about to be signed, and they refuse anything the module's [`Grant`] does not name even
 //! when the bot's own allowlist would have permitted it.
+//!
+//! [`ModuleView`] is the only wallet surface a host trait should expose: reads and audit writes.
+//! It has no `sign_*` method.
+
+use std::future::Future;
 
 use alloy::consensus::TxEip1559;
 use alloy::dyn_abi::TypedData;
 use alloy::primitives::{Address, Selector, TxKind};
-use keyshare_core::policy::{Action, PlainPolicy, PolicyEngine, TypedDataRule, Verdict};
+use keyshare_core::audit::AuditEvent;
+use keyshare_core::policy::{Action, Limits, PlainPolicy, PolicyEngine, TypedDataRule, Verdict};
 use keyshare_core::price::{PriceSource, UsdMicros};
 use keyshare_core::{Refusal, RefusalCode};
+use serde_json::Value;
 
 /// What the module asks the core to sign. There is no path here that carries a signature back
 /// from the module; the core produces the signature after [`authorize_tx`] or [`authorize_typed`].
@@ -109,6 +116,37 @@ pub fn authorize_typed(grant: &Grant, data: &TypedData) -> Result<(), Refusal> {
         ));
     }
     grant.covers_typed(data)
+}
+
+/// What a module may ask the connector about a bot. Reads and audit writes only: there is no
+/// signer, and no way to reach `Wallet::sign_transaction`, `sign_message`, or `sign_typed_data`.
+pub trait ModuleView: Send + Sync {
+    fn address(&self, caller: &str) -> impl Future<Output = Result<Address, Refusal>> + Send;
+    fn limits(&self, caller: &str) -> impl Future<Output = Result<Limits, Refusal>> + Send;
+    fn spent_24h(&self, caller: &str, now: u64) -> impl Future<Output = Result<UsdMicros, Refusal>> + Send;
+    fn check_kill_switch(&self, caller: &str) -> impl Future<Output = Result<(), Refusal>> + Send;
+    fn preview_tx(
+        &self,
+        caller: &str,
+        tx: TxEip1559,
+        now: u64,
+    ) -> impl Future<Output = Result<Verdict, Refusal>> + Send;
+    fn log_event(
+        &self,
+        caller: &str,
+        request_id: &str,
+        event: AuditEvent,
+        detail: Value,
+        now: u64,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+    fn log_refusal(
+        &self,
+        caller: &str,
+        request_id: &str,
+        detail: Value,
+        refusal: &Refusal,
+        now: u64,
+    ) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 /// Runs the matching authorizer. There is no signer argument: the caller signs only after `Ok`.

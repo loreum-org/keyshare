@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 alloy.workspace = true
 keyshare-core = { path = "../keyshare-core" }
+keyshare-module = { path = "../keyshare-module" }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rmcp = { version = "3.11", features = ["server", "macros"] }
 rmp-serde = "1.3"

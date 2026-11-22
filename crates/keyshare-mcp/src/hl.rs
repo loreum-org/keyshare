@@ -4,9 +4,31 @@
 
 pub use keyshare_hyperliquid::{AgentFile, HlConfig, Hyperliquid, OrderSpec, agent_path, check_api_url, now_ms};
 
-use keyshare_core::{LocalSigner, Signer};
+use keyshare_core::{LocalSigner, Refusal, RefusalCode, Signer};
+use keyshare_hyperliquid::agent_expired;
 
 use crate::config::Config;
+
+/// Loads the agent key the owner approved. Only the connector does this; the module asks
+/// [`keyshare_hyperliquid::HlHost::sign_l1`] and never sees the key bytes.
+pub(crate) fn open_agent(hl: &Hyperliquid, bot: &str) -> Result<LocalSigner, Refusal> {
+    let none = |why: &str| {
+        Refusal::new(
+            RefusalCode::NoAgentKey,
+            format!("{why}; the owner runs `keyshare-mcp hl-approve-agent <config> {bot}`"),
+        )
+    };
+    let text = std::fs::read_to_string(hl.agent_path_for(bot)).map_err(|_| none("no agent key"))?;
+    let file: AgentFile = serde_json::from_str(&text).map_err(|_| none("agent key file is unreadable"))?;
+    if agent_expired(file.valid_until_ms, now_ms()) {
+        return Err(none("agent key has expired"));
+    }
+    let signer = LocalSigner::from_hex(&file.key).map_err(|_| none("agent key file is unreadable"))?;
+    if signer.address() != file.address {
+        return Err(none("agent key does not match its address"));
+    }
+    Ok(signer)
+}
 
 pub async fn approve_agent(
     config: &Config,

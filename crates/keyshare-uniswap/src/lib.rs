@@ -16,11 +16,9 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use keyshare_core::{Action, Refusal, RefusalCode};
+use keyshare_core::{Refusal, RefusalCode};
+use keyshare_module::{Grant, ModuleView};
 use serde_json::{Value, json};
-
-use keyshare_core::Wallet;
-use keyshare_module::Grant;
 
 /// Result of a tool: `Ok` is the payload, `Err` is a refusal object.
 pub type Outcome = Result<Value, Value>;
@@ -55,9 +53,10 @@ pub fn grant(router: Address) -> Grant {
     }
 }
 
-/// The connector core. Quoting stays here; signing and broadcast stay on the host, which runs
-/// [`authorize_tx`] before [`SwapHost::submit`] reaches the chain.
-pub trait SwapHost: Send + Sync {
+/// The connector core. Quoting stays here; signing and broadcast stay on the host, which checks
+/// the module grant and then the bot policy before [`SwapHost::submit`] reaches the chain.
+/// [`ModuleView`] is reads and audit writes. It cannot sign.
+pub trait SwapHost: ModuleView {
     fn provider(&self, chain_id: u64) -> Result<&RootProvider, Refusal>;
     fn uniswap(&self, chain_id: u64) -> Result<&UniswapV3, Refusal>;
     fn token_decimals(&self, chain_id: u64, token: Address) -> impl Future<Output = Result<u8, Refusal>> + Send;
@@ -66,10 +65,6 @@ pub trait SwapHost: Send + Sync {
         chain_id: u64,
         hash: alloy::primitives::B256,
     ) -> impl Future<Output = Result<String, Refusal>> + Send;
-    fn with_wallet<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
-    ) -> impl Future<Output = Result<T, String>> + Send;
     fn submit(
         &self,
         caller: &str,
@@ -236,12 +231,10 @@ pub async fn swap(exec: &impl SwapHost, caller: &str, id: &str, req: SwapRequest
 
     // Check the swap itself before approving anything, so a swap the policy refuses never
     // leaves an approve behind.
-    let (c, t) = (caller.to_string(), tx.clone());
-    if let Err(r) = exec.with_wallet(move |w| w.preview(&c, Action::Transaction(&t), now_secs())).await? {
+    if let Err(r) = exec.preview_tx(caller, tx.clone(), now_secs()).await {
         if !req.dry_run {
-            let (c, k, r2) = (caller.to_string(), format!("{caller}:{id}"), r.clone());
             let d = json!({ "swap": quote_json.clone() });
-            exec.with_wallet(move |w| w.log_refusal(&c, &k, d, &r2, now_secs())).await?;
+            exec.log_refusal(caller, &format!("{caller}:{id}"), d, &r, now_secs()).await?;
         }
         return Ok(with_quote(Err(refusal(id, &r))));
     }
@@ -331,11 +324,8 @@ async fn prepare<'a>(
     }
     let p = exec.provider(req.chain_id)?;
     let u = exec.uniswap(req.chain_id)?;
-    let c = caller.to_string();
-    let (owner, limits) = exec
-        .with_wallet(move |w| Ok::<_, Refusal>((w.address(&c)?, w.limits(&c)?)))
-        .await
-        .map_err(|e| Refusal::new(RefusalCode::Internal, e))??;
+    let owner = exec.address(caller).await?;
+    let limits = exec.limits(caller).await?;
     let slippage_bps = req.max_slippage_bps.unwrap_or(limits.max_slippage_bps);
     if slippage_bps > limits.max_slippage_bps {
         return Err(Refusal::new(
@@ -372,6 +362,69 @@ async fn prepare<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SwapHost` is implementable with no `Wallet`. A `with_wallet` method on the trait would
+    /// fail this impl.
+    struct BareHost;
+
+    fn bare() -> Refusal {
+        Refusal::new(RefusalCode::Internal, "bare host has no wallet")
+    }
+
+    impl ModuleView for BareHost {
+        async fn address(&self, _: &str) -> Result<Address, Refusal> {
+            Err(bare())
+        }
+        async fn limits(&self, _: &str) -> Result<keyshare_core::policy::Limits, Refusal> {
+            Err(bare())
+        }
+        async fn spent_24h(&self, _: &str, _: u64) -> Result<keyshare_core::price::UsdMicros, Refusal> {
+            Err(bare())
+        }
+        async fn check_kill_switch(&self, _: &str) -> Result<(), Refusal> {
+            Err(bare())
+        }
+        async fn preview_tx(&self, _: &str, _: TxEip1559, _: u64) -> Result<keyshare_core::policy::Verdict, Refusal> {
+            Err(bare())
+        }
+        async fn log_event(
+            &self,
+            _: &str,
+            _: &str,
+            _: keyshare_core::audit::AuditEvent,
+            _: Value,
+            _: u64,
+        ) -> Result<(), String> {
+            Err("bare host has no wallet".into())
+        }
+        async fn log_refusal(&self, _: &str, _: &str, _: Value, _: &Refusal, _: u64) -> Result<(), String> {
+            Err("bare host has no wallet".into())
+        }
+    }
+
+    impl SwapHost for BareHost {
+        fn provider(&self, _: u64) -> Result<&RootProvider, Refusal> {
+            Err(bare())
+        }
+        fn uniswap(&self, _: u64) -> Result<&UniswapV3, Refusal> {
+            Err(bare())
+        }
+        async fn token_decimals(&self, _: u64, _: Address) -> Result<u8, Refusal> {
+            Err(bare())
+        }
+        async fn tx_state(&self, _: u64, _: alloy::primitives::B256) -> Result<String, Refusal> {
+            Err(bare())
+        }
+        async fn submit(&self, _: &str, _: &str, _: TxEip1559, _: bool) -> Result<Outcome, String> {
+            Err("bare host has no wallet".into())
+        }
+    }
+
+    #[test]
+    fn host_trait_does_not_require_a_wallet() {
+        fn assert_host<T: SwapHost>() {}
+        assert_host::<BareHost>();
+    }
 
     #[test]
     fn selectors_match_deployed_contracts() {
