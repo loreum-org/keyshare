@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
-use keyshare_core::hyperliquid::HlPolicy;
 use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
+use keyshare_hyperliquid::HlPolicy;
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
@@ -102,6 +102,32 @@ pub struct BotConfig {
     pub policy: PlainPolicy,
     /// Hyperliquid testnet guardrails. Without this table the `hl_*` tools refuse this bot.
     pub hyperliquid: Option<HlPolicy>,
+    /// Turn a module's tools off for this bot. Omitted modules stay on, which is how every
+    /// existing config file behaves.
+    #[serde(default)]
+    pub modules: ModuleSwitch,
+}
+
+/// Per-bot module switches. Defaults keep today's tool list: both modules exposed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleSwitch {
+    /// `hl_*` tools. Default true, even when this bot has no `[hyperliquid]` table.
+    #[serde(default = "module_on")]
+    pub hyperliquid: bool,
+    /// The `swap` tool. Default true.
+    #[serde(default = "module_on")]
+    pub uniswap: bool,
+}
+
+fn module_on() -> bool {
+    true
+}
+
+impl Default for ModuleSwitch {
+    fn default() -> Self {
+        Self { hyperliquid: true, uniswap: true }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -4,7 +4,7 @@
 pub mod approval;
 pub mod audit;
 pub mod chainlog;
-pub mod hyperliquid;
+pub mod intent;
 pub mod killswitch;
 pub mod policy;
 pub mod price;
@@ -13,6 +13,7 @@ pub mod signer;
 pub mod spend;
 pub mod wallet;
 
+pub use intent::{ContractAllow, Intent, ModuleAllowlist, TypedAllow};
 pub use policy::{Action, Limits, PlainPolicy, PolicyEngine, TypedDataRule, Verdict};
 pub use price::{PriceSource, PriceTable, UsdMicros};
 pub use refusal::{Refusal, RefusalCode};

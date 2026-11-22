@@ -3,20 +3,29 @@
 //! admin approval instead (§13.2). Shared by the MCP tools and the admin endpoints.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::TxEip1559;
-use alloy::primitives::{B256, Signature};
+use alloy::dyn_abi::TypedData;
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{Address, B256, Bytes, Signature};
+use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
+use async_trait::async_trait;
 use keyshare_core::approval::{self, Decision};
 use keyshare_core::audit::AuditEvent;
 use keyshare_core::price::{MICROS_PER_USD, PriceEntry};
-use keyshare_core::{Action, Refusal, RefusalCode, Wallet};
+use keyshare_core::{Action, Intent, Refusal, RefusalCode, Signer, Wallet};
+use keyshare_hyperliquid::HyperliquidModule;
+use keyshare_module::{ChainTxStatus, Core, Outcome as ModuleOutcome, Registry, UniswapDeployment};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
-use crate::hl::Hyperliquid;
+use crate::config::ModuleSwitch;
+use crate::hl::{self, Hyperliquid};
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
 pub const DEFAULT_HOLD_SECS: u64 = 15 * 60;
@@ -74,6 +83,11 @@ pub struct Executor {
     pub chains: Arc<Chains>,
     pub tokens: Arc<Vec<PriceEntry>>,
     pub hl: Option<Arc<Hyperliquid>>,
+    registry: Registry,
+    /// Per-bot module switches. Missing bot means both modules stay exposed.
+    toggles: HashMap<String, ModuleSwitch>,
+    /// Where the Hyperliquid agent file lives. Empty until [`Executor::with_hyperliquid`].
+    state_dir: PathBuf,
     /// Held from nonce lookup to broadcast so two sends never get the same nonce.
     send_lock: tokio::sync::Mutex<()>,
     /// Keyed by the caller-scoped request id. In memory: a restart drops held requests, which
@@ -106,11 +120,30 @@ pub fn scoped(caller: &str, id: &str) -> String {
 
 impl Executor {
     pub fn new(wallet: Arc<Mutex<Wallet>>, chains: Arc<Chains>, tokens: Arc<Vec<PriceEntry>>, hold_secs: u64) -> Self {
+        let deployments = chains
+            .uniswap_all()
+            .into_iter()
+            .map(|(chain_id, u)| UniswapDeployment {
+                chain_id,
+                router: u.router,
+                quoter: u.quoter,
+                weth: u.weth,
+                fee_tiers: u.fee_tiers,
+            })
+            .collect();
+        let mut registry = Registry::new();
+        // Tool ownership is known even when this process has no Hyperliquid client.
+        // Disabling the module can then hide `hl_*` instead of leaving them as core tools.
+        registry.claim_tools(keyshare_hyperliquid::MODULE_ID, keyshare_hyperliquid::TOOLS);
+        registry.register(keyshare_uniswap::module(deployments));
         Self {
             wallet,
             chains,
             tokens,
             hl: None,
+            registry,
+            toggles: HashMap::new(),
+            state_dir: PathBuf::new(),
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
@@ -118,8 +151,31 @@ impl Executor {
     }
 
     pub fn with_hyperliquid(mut self, hl: Hyperliquid) -> Self {
-        self.hl = Some(Arc::new(hl));
+        self.state_dir = hl.state_dir().to_path_buf();
+        let hl = Arc::new(hl);
+        self.registry.register(Arc::new(HyperliquidModule::new(hl.clone())));
+        self.hl = Some(hl);
         self
+    }
+
+    /// Per-bot module switches from the config. Bots left out keep both modules exposed.
+    pub fn with_modules(mut self, toggles: HashMap<String, ModuleSwitch>) -> Self {
+        self.toggles = toggles;
+        self
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// `true` when `module` should advertise and serve tools for `bot`.
+    pub fn module_enabled(&self, bot: &str, module: &str) -> bool {
+        match self.toggles.get(bot) {
+            Some(sw) if module == keyshare_hyperliquid::MODULE_ID => sw.hyperliquid,
+            Some(sw) if module == keyshare_uniswap::MODULE_ID => sw.uniswap,
+            Some(_) => false,
+            None => true,
+        }
     }
 
     /// Runs `f` on the wallet off the async runtime (it does fsyncs).
@@ -460,5 +516,143 @@ impl Executor {
                 Ok(out)
             }
         }
+    }
+}
+
+#[async_trait]
+impl Core for Executor {
+    async fn address(&self, caller: &str) -> Result<Result<Address, Refusal>, String> {
+        let c = caller.to_string();
+        self.with_wallet(move |w| w.address(&c)).await
+    }
+
+    async fn max_slippage_bps(&self, caller: &str) -> Result<u32, Refusal> {
+        let c = caller.to_string();
+        match self.with_wallet(move |w| w.limits(&c)).await {
+            Ok(Ok(limits)) => Ok(limits.max_slippage_bps),
+            Ok(Err(r)) => Err(r),
+            Err(e) => Err(Refusal::new(RefusalCode::Internal, e)),
+        }
+    }
+
+    async fn kill_check(&self, caller: &str) -> Result<Result<(), Refusal>, String> {
+        let c = caller.to_string();
+        self.with_wallet(move |w| w.kill_switch().check(&c)).await
+    }
+
+    async fn log_event(
+        &self,
+        caller: &str,
+        request_id: &str,
+        event: AuditEvent,
+        detail: Value,
+        now_secs: u64,
+    ) -> Result<(), String> {
+        let caller = caller.to_string();
+        let request_id = request_id.to_string();
+        self.with_wallet(move |w| w.log_event(&caller, &request_id, event, detail, now_secs)).await
+    }
+
+    async fn log_refusal(
+        &self,
+        caller: &str,
+        request_id: &str,
+        detail: Value,
+        refusal: &Refusal,
+        now_secs: u64,
+    ) -> Result<(), String> {
+        let caller = caller.to_string();
+        let request_id = request_id.to_string();
+        let refusal = refusal.clone();
+        self.with_wallet(move |w| w.log_refusal(&caller, &request_id, detail, &refusal, now_secs)).await
+    }
+
+    async fn preview_module_tx(
+        &self,
+        module_id: &str,
+        caller: &str,
+        tx: &TxEip1559,
+        now_secs: u64,
+    ) -> Result<Result<(), Refusal>, String> {
+        if let Err(r) = self.module_intent_tx(module_id, tx) {
+            return Ok(Err(r));
+        }
+        let c = caller.to_string();
+        let tx = tx.clone();
+        self.with_wallet(move |w| w.preview(&c, Action::Transaction(&tx), now_secs).map(|_| ())).await
+    }
+
+    async fn submit_module_tx(
+        &self,
+        module_id: &str,
+        caller: &str,
+        id: &str,
+        tx: TxEip1559,
+        dry_run: bool,
+    ) -> Result<ModuleOutcome, String> {
+        if let Err(r) = self.module_intent_tx(module_id, &tx) {
+            // The module built something outside the allowlist it declared.
+            // Log it and do not sign. A log failure still refuses the request.
+            let _ = self.log_refusal(caller, id, json!({ "module": module_id, "to": tx.to.to() }), &r, now()).await;
+            return Ok(Err(refusal(id, &r)));
+        }
+        self.submit(caller, id, tx, dry_run).await
+    }
+
+    async fn venue_key_ready(&self, module_id: &str, bot: &str) -> Result<(), Refusal> {
+        if module_id != keyshare_hyperliquid::MODULE_ID {
+            return Err(Refusal::new(RefusalCode::Internal, format!("{module_id} has no venue key")));
+        }
+        hl::load_agent(&self.state_dir, bot).map(|_| ())
+    }
+
+    async fn sign_venue(&self, module_id: &str, bot: &str, data: &TypedData) -> Result<Signature, Refusal> {
+        let allow = self
+            .registry
+            .allowlist(module_id)
+            .ok_or_else(|| Refusal::new(RefusalCode::Internal, format!("no allowlist registered for {module_id}")))?;
+        // The registered allowlist, not one the module passes in with the call.
+        Intent::TypedData(data.clone()).check(allow)?;
+        let signer = hl::load_agent(&self.state_dir, bot)?;
+        signer.sign_typed_data(data).map_err(|e| Refusal::new(RefusalCode::Internal, e.to_string()))
+    }
+
+    async fn eth_call(&self, chain_id: u64, to: Address, data: Bytes) -> Result<Bytes, Refusal> {
+        let provider = self.chains.get(chain_id)?;
+        let req = TransactionRequest::default().with_to(to).with_input(data);
+        let out: Bytes = provider.call(req).await.map_err(chain::rpc_err)?;
+        Ok(out)
+    }
+
+    async fn token_decimals(&self, chain_id: u64, token: Address) -> Result<u8, Refusal> {
+        chain::token_decimals(self.chains.get(chain_id)?, token).await
+    }
+
+    async fn tx_status(&self, chain_id: u64, hash: B256) -> Result<ChainTxStatus, Refusal> {
+        let status = chain::tx_status(self.chains.get(chain_id)?, hash).await?;
+        Ok(ChainTxStatus { state: status.state })
+    }
+
+    fn uniswap(&self, chain_id: u64) -> Result<UniswapDeployment, Refusal> {
+        // A chain with no RPC is CHAIN_NOT_ALLOWED, before the "no router" answer.
+        let _provider = self.chains.get(chain_id)?;
+        let deployment = self.chains.uniswap(chain_id)?;
+        Ok(UniswapDeployment {
+            chain_id,
+            router: deployment.router,
+            quoter: deployment.quoter,
+            weth: deployment.weth,
+            fee_tiers: deployment.fee_tiers.clone(),
+        })
+    }
+}
+
+impl Executor {
+    fn module_intent_tx(&self, module_id: &str, tx: &TxEip1559) -> Result<(), Refusal> {
+        let allow = self
+            .registry
+            .allowlist(module_id)
+            .ok_or_else(|| Refusal::new(RefusalCode::Internal, format!("no allowlist registered for {module_id}")))?;
+        Intent::Transaction(tx.clone()).check(allow)
     }
 }

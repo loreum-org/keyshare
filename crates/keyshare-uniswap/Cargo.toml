@@ -1,0 +1,19 @@
+[package]
+name = "keyshare-uniswap"
+description = "Uniswap v3 swap module for keyshare. Builds intents; does not hold the signing key."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+keyshare-core = { path = "../keyshare-core" }
+keyshare-module = { path = "../keyshare-module" }
+alloy.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["time"] }
+toml.workspace = true
+
+[lints]
+workspace = true

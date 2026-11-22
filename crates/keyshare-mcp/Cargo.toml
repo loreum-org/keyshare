@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 keyshare-core = { path = "../keyshare-core" }
+keyshare-hyperliquid = { path = "../keyshare-hyperliquid" }
+keyshare-module = { path = "../keyshare-module" }
+keyshare-uniswap = { path = "../keyshare-uniswap" }
 alloy = { workspace = true, features = ["provider-http", "reqwest-rustls-tls", "rpc-types", "network"] }
 axum = "0.8"
 http = "1"
@@ -18,10 +21,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
 thiserror.workspace = true
+async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 toml.workspace = true
 
 [dev-dependencies]
+keyshare-hyperliquid = { path = "../keyshare-hyperliquid" }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 

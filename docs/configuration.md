@@ -111,3 +111,18 @@ Without this section the bot can't use the Hyperliquid tools. [Hyperliquid](hype
 | `equity_floor_usd` | Optional. Positive whole USD, at most 1_000_000_000_000. At or below this equity, new risk is refused until `reset_equity_floor`. Unset means no absolute floor. |
 | `max_drawdown_from_peak_usd` | Optional. Same bounds. New risk stops this far below the persisted high-water mark. Unset means no trailing floor. |
 | `reset_equity_floor` | Optional, default false. Set `true` and restart to clear a latched equity-floor breach once. Set it back to `false` afterward. It does not lower the high-water mark and it does not flatten the account. |
+
+## `[bots.<name>.modules]`
+
+Optional. Leave it out and every module stays available, which is what existing config files do. Set a flag to `false` to hide that module's tools from this bot. The other settings (`[bots.<name>.hyperliquid]`, chain routers, policy allowlists) stay as they are; a hidden tool is not callable.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `hyperliquid` | `true` | Expose `hl_positions`, `hl_place_order`, `hl_modify`, `hl_cancel`, and `hl_set_leverage`. |
+| `uniswap` | `true` | Expose `swap`. |
+
+```toml
+[bots.filltape.modules]
+hyperliquid = false
+uniswap = true
+```

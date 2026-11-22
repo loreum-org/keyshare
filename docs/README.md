@@ -16,4 +16,6 @@ These docs cover what is built today (Phase 0). The long-term design, including 
 | [Hyperliquid](hyperliquid.md) | Trading on Hyperliquid testnet with agent keys and trading limits |
 | [Safety and state](safety.md) | The kill switch, the spend log, the audit log, and known gaps before mainnet |
 | [Code layout](code.md) | Where things live in the source, for developers |
+| [Architecture](architecture.md) | Core, modules, and the intent the core signs |
+| [Writing a module](writing-a-module.md) | How to add a protocol without touching the key |
 | [Design](design.md) | The full long-term design (v0.1) |

@@ -2,24 +2,21 @@
 //!
 //! The quote comes from QuoterV2 on the same RPC, the minimum out is that quote less the
 //! slippage, and the output always goes back to the bot's own wallet. Both transactions (the
-//! exact-amount approve, then the swap) go through [`Executor::submit`], so the router and token
-//! must be allowlisted and the approve counts against the caps like any other outflow.
+//! exact-amount approve, then the swap) are intents the core re-checks against this module's
+//! allowlist and then against the bot's policy. This module does not sign.
 
 use std::time::Duration;
 
 use alloy::consensus::TxEip1559;
-use alloy::network::TransactionBuilder;
 use alloy::primitives::utils::{format_units, parse_units};
 use alloy::primitives::{Address, TxKind, U256, aliases::U24};
-use alloy::providers::{Provider, RootProvider};
-use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use keyshare_core::{Action, Refusal, RefusalCode};
+use keyshare_core::{Refusal, RefusalCode};
+use keyshare_module::{Core, Outcome, UniswapDeployment, unix_now};
 use serde_json::{Value, json};
 
-use crate::chain::{self, UniswapV3, rpc_bad, rpc_err};
-use crate::exec::{Executor, Outcome};
+use crate::MODULE_ID;
 
 sol! {
     struct QuoteExactInputSingleParams {
@@ -78,7 +75,18 @@ fn bad_args(why: impl Into<String>) -> Refusal {
     Refusal::new(RefusalCode::BadArgs, why)
 }
 
-async fn best_quote(p: &RootProvider, u: &UniswapV3, sell: Address, buy: Address, amount: U256) -> Option<Quote> {
+fn rpc_bad(why: impl std::fmt::Display) -> Refusal {
+    Refusal::new(RefusalCode::RpcUnavailable, format!("rpc: {why}"))
+}
+
+async fn best_quote(
+    core: &dyn Core,
+    chain_id: u64,
+    u: &UniswapDeployment,
+    sell: Address,
+    buy: Address,
+    amount: U256,
+) -> Option<Quote> {
     let mut best: Option<Quote> = None;
     for &fee in &u.fee_tiers {
         let call = quoteExactInputSingleCall {
@@ -90,9 +98,8 @@ async fn best_quote(p: &RootProvider, u: &UniswapV3, sell: Address, buy: Address
                 sqrtPriceLimitX96: Default::default(),
             },
         };
-        let req = TransactionRequest::default().with_to(u.quoter).with_input(call.abi_encode());
         // A missing pool reverts; that tier is simply skipped.
-        let Ok(out) = p.call(req).await else { continue };
+        let Ok(out) = core.eth_call(chain_id, u.quoter, call.abi_encode().into()).await else { continue };
         let Ok(q) = quoteExactInputSingleCall::abi_decode_returns(&out) else { continue };
         if q.amountOut > U256::ZERO && best.is_none_or(|b| q.amountOut > b.amount_out) {
             best = Some(Quote { fee, amount_out: q.amountOut });
@@ -101,15 +108,21 @@ async fn best_quote(p: &RootProvider, u: &UniswapV3, sell: Address, buy: Address
     best
 }
 
-async fn allowance_of(p: &RootProvider, token: Address, owner: Address, spender: Address) -> Result<U256, Refusal> {
-    let req = TransactionRequest::default().with_to(token).with_input(allowanceCall { owner, spender }.abi_encode());
-    let out = p.call(req).await.map_err(rpc_err)?;
+async fn allowance_of(
+    core: &dyn Core,
+    chain_id: u64,
+    token: Address,
+    owner: Address,
+    spender: Address,
+) -> Result<U256, Refusal> {
+    let data = allowanceCall { owner, spender }.abi_encode().into();
+    let out = core.eth_call(chain_id, token, data).await?;
     allowanceCall::abi_decode_returns(&out).map_err(|e| rpc_bad(format!("allowance on {token}: {e}")))
 }
 
-async fn wait_confirmed(p: &RootProvider, hash: alloy::primitives::B256) -> Result<(), Refusal> {
+async fn wait_confirmed(core: &dyn Core, chain_id: u64, hash: alloy::primitives::B256) -> Result<(), Refusal> {
     for _ in 0..APPROVE_WAIT_SECS {
-        match chain::tx_status(p, hash).await?.state {
+        match core.tx_status(chain_id, hash).await?.state {
             "confirmed" => return Ok(()),
             "failed" => return Err(Refusal::new(RefusalCode::SimRevert, format!("approve {hash} failed on chain"))),
             _ => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -122,9 +135,9 @@ async fn wait_confirmed(p: &RootProvider, hash: alloy::primitives::B256) -> Resu
 }
 
 /// Quotes, then (unless `dry_run`) approves the router for exactly `amount` if needed and swaps.
-pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> Result<Outcome, String> {
-    let prepared = prepare(exec, caller, &req).await;
-    let (p, u, owner, plan) = match prepared {
+pub async fn swap(core: &dyn Core, caller: &str, id: &str, req: SwapRequest) -> Result<Outcome, String> {
+    let prepared = prepare(core, caller, &req).await;
+    let (u, owner, plan) = match prepared {
         Ok(x) => x,
         Err(r) => return Ok(Err(refusal(id, &r))),
     };
@@ -163,13 +176,12 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
     };
 
     // Check the swap itself before approving anything, so a swap the policy refuses never
-    // leaves an approve behind.
-    let (c, t) = (caller.to_string(), tx.clone());
-    if let Err(r) = exec.with_wallet(move |w| w.preview(&c, Action::Transaction(&t), crate::exec::now())).await? {
+    // leaves an approve behind. The core also checks the module allowlist.
+    if let Err(r) = core.preview_module_tx(MODULE_ID, caller, &tx, unix_now()).await? {
         if !req.dry_run {
-            let (c, k, r2) = (caller.to_string(), crate::exec::scoped(caller, id), r.clone());
             let d = json!({ "swap": quote_json.clone() });
-            exec.with_wallet(move |w| w.log_refusal(&c, &k, d, &r2, crate::exec::now())).await?;
+            let scoped = format!("{caller}:{id}");
+            core.log_refusal(caller, &scoped, d, &r, unix_now()).await?;
         }
         return Ok(with_quote(Err(refusal(id, &r))));
     }
@@ -177,7 +189,7 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
     // Approve the router for exactly this amount when the current allowance is short.
     let mut approve_out = None;
     if let Some(token) = req.sell_token {
-        let current = match allowance_of(p, token, owner, u.router).await {
+        let current = match allowance_of(core, req.chain_id, token, owner, u.router).await {
             Ok(a) => a,
             Err(r) => return Ok(with_quote(Err(refusal(id, &r)))),
         };
@@ -189,7 +201,7 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
                 ..Default::default()
             };
             let approve_id = format!("{id}-approve");
-            let out = exec.submit(caller, &approve_id, tx, req.dry_run).await?;
+            let out = core.submit_module_tx(MODULE_ID, caller, &approve_id, tx, req.dry_run).await?;
             let v = match out {
                 Ok(v) => v,
                 Err(mut v) => {
@@ -214,7 +226,7 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
                 }))));
             }
             if let Some(hash) = v["tx_hash"].as_str().and_then(|h| h.parse().ok())
-                && let Err(r) = wait_confirmed(p, hash).await
+                && let Err(r) = wait_confirmed(core, req.chain_id, hash).await
             {
                 let mut out = refusal(id, &r);
                 out["approve"] = v;
@@ -224,7 +236,7 @@ pub async fn swap(exec: &Executor, caller: &str, id: &str, req: SwapRequest) -> 
         }
     }
 
-    let mut out = exec.submit(caller, id, tx, req.dry_run).await?;
+    let mut out = core.submit_module_tx(MODULE_ID, caller, id, tx, req.dry_run).await?;
     if let (Some(a), Ok(v) | Err(v)) = (approve_out, &mut out) {
         v["approve"] = a;
     }
@@ -240,11 +252,11 @@ struct Plan {
     slippage_bps: u32,
 }
 
-async fn prepare<'a>(
-    exec: &'a Executor,
+async fn prepare(
+    core: &dyn Core,
     caller: &str,
     req: &SwapRequest,
-) -> Result<(&'a RootProvider, &'a UniswapV3, Address, Plan), Refusal> {
+) -> Result<(UniswapDeployment, Address, Plan), Refusal> {
     if let Some(r) = &req.route_provider
         && r != "uniswap_v3"
     {
@@ -253,18 +265,14 @@ async fn prepare<'a>(
             format!("route provider {r:?} is not supported; use uniswap_v3"),
         ));
     }
-    let p = exec.chains.get(req.chain_id)?;
-    let u = exec.chains.uniswap(req.chain_id)?;
-    let c = caller.to_string();
-    let (owner, limits) = exec
-        .with_wallet(move |w| Ok::<_, Refusal>((w.address(&c)?, w.limits(&c)?)))
-        .await
-        .map_err(|e| Refusal::new(RefusalCode::Internal, e))??;
-    let slippage_bps = req.max_slippage_bps.unwrap_or(limits.max_slippage_bps);
-    if slippage_bps > limits.max_slippage_bps {
+    let u = core.uniswap(req.chain_id)?;
+    let owner = core.address(caller).await.map_err(|e| Refusal::new(RefusalCode::Internal, e))??;
+    let cap = core.max_slippage_bps(caller).await?;
+    let slippage_bps = req.max_slippage_bps.unwrap_or(cap);
+    if slippage_bps > cap {
         return Err(Refusal::new(
             RefusalCode::SlippageTooHigh,
-            format!("{slippage_bps} bps is over this bot's {} bps limit", limits.max_slippage_bps),
+            format!("{slippage_bps} bps is over this bot's {cap} bps limit"),
         ));
     }
     let token_in = req.sell_token.unwrap_or(u.weth);
@@ -273,15 +281,15 @@ async fn prepare<'a>(
     }
     let sell_decimals = match req.sell_token {
         None => 18,
-        Some(t) => chain::token_decimals(p, t).await?,
+        Some(t) => core.token_decimals(req.chain_id, t).await?,
     };
-    let buy_decimals = chain::token_decimals(p, req.buy_token).await?;
+    let buy_decimals = core.token_decimals(req.chain_id, req.buy_token).await?;
     let amount_in: U256 =
         parse_units(&req.amount, sell_decimals).map_err(|e| bad_args(format!("amount {:?}: {e}", req.amount)))?.into();
     if amount_in.is_zero() {
         return Err(bad_args("amount must be above zero"));
     }
-    let quote = best_quote(p, u, token_in, req.buy_token, amount_in)
+    let quote = best_quote(core, req.chain_id, &u, token_in, req.buy_token, amount_in)
         .await
         .ok_or_else(|| Refusal::new(RefusalCode::NoRoute, "no Uniswap v3 pool quotes this pair"))?;
     let keep = U256::from(10_000u32 - slippage_bps.min(10_000));
@@ -290,7 +298,7 @@ async fn prepare<'a>(
         .checked_mul(keep)
         .and_then(|v| v.checked_div(U256::from(10_000u32)))
         .ok_or_else(|| Refusal::new(RefusalCode::Internal, "quote is too large to apply slippage"))?;
-    Ok((p, u, owner, Plan { token_in, amount_in, buy_decimals, quote, min_out, slippage_bps }))
+    Ok((u, owner, Plan { token_in, amount_in, buy_decimals, quote, min_out, slippage_bps }))
 }
 
 #[cfg(test)]

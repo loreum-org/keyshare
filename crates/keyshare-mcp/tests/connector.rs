@@ -87,6 +87,10 @@ async fn fixture() -> Fixture {
 }
 
 async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
+    fixture_extra(hold_secs, allowed_hosts, "").await
+}
+
+async fn fixture_extra(hold_secs: u64, allowed_hosts: &[&str], extra: &str) -> Fixture {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let rpc_url = mock_rpc(sent.clone()).await;
     let dir = tempfile::tempdir().unwrap();
@@ -138,6 +142,7 @@ async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
         per_tx_cap_usd = 200
         daily_cap_usd = 500
         recipients_allow = ["{OWNER}"]
+        {extra}
         "#,
         state = dir.path().join("state").display(),
         hash = token_hash(TOKEN),
@@ -153,7 +158,8 @@ async fn fixture_with(hold_secs: u64, allowed_hosts: &[&str]) -> Fixture {
     let creds: Credentials = Arc::new(config.credentials().unwrap());
     let chains = Arc::new(keyshare_mcp::chain::Chains::new(&config.chains).unwrap());
     let tokens = Arc::new(config.prices.clone());
-    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, hold_secs));
+    let toggles = config.bots.iter().map(|(id, bot)| (id.clone(), bot.modules.clone())).collect();
+    let exec = Arc::new(Executor::new(wallet.clone(), chains, tokens, hold_secs).with_modules(toggles));
     let hosts: Vec<String> = allowed_hosts.iter().map(|h| (*h).to_string()).collect();
     let app = keyshare_mcp::app(exec, creds, Some(token_hash(ADMIN_TOKEN)), &hosts);
     Fixture { app, wallet, sent, _dir: dir }
@@ -301,6 +307,33 @@ async fn lists_tools() {
             "tx_status"
         ]
     );
+}
+
+#[tokio::test]
+async fn disabled_module_tools_are_not_exposed() {
+    let extra = r#"
+        [bots.filltape.modules]
+        hyperliquid = false
+        uniswap = false
+    "#;
+    let f = fixture_extra(DEFAULT_HOLD_SECS, &[], extra).await;
+    let s = session(&f.app).await;
+    let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"});
+    let (_, _, resp) = rpc(&f.app, Some(TOKEN), s.as_deref(), body).await;
+    let names: Vec<&str> =
+        resp["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"send"), "{names:?}");
+    assert!(names.contains(&"limits"), "{names:?}");
+    assert!(!names.contains(&"swap"), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("hl_")), "{names:?}");
+
+    let call = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "swap", "arguments": {"chain_id": 11155111, "buy_token": OWNER, "amount": "1"}}
+    });
+    let (_, _, resp) = rpc(&f.app, Some(TOKEN), s.as_deref(), call).await;
+    let message = resp["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("not found"), "{resp}");
 }
 
 #[tokio::test]

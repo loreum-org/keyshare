@@ -11,8 +11,8 @@ use alloy::primitives::{Address, B256, Signature, keccak256};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::price::UsdMicros;
-use crate::refusal::{Refusal, RefusalCode};
+use keyshare_core::price::UsdMicros;
+use keyshare_core::refusal::{Refusal, RefusalCode};
 
 /// Hyperliquid's L1 signing domain uses this chain id whatever chain the wallet is on.
 const L1_CHAIN_ID: u64 = 1337;
@@ -458,7 +458,7 @@ impl HlPolicy {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{LocalSigner, Signer};
+    use keyshare_core::{LocalSigner, Signer};
 
     /// The SDK's test key.
     const KEY: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";

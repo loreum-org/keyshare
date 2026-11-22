@@ -100,6 +100,12 @@ impl Chains {
         })
     }
 
+    pub fn uniswap_all(&self) -> Vec<(u64, UniswapV3)> {
+        let mut out: Vec<_> = self.uniswap.iter().map(|(id, u)| (*id, u.clone())).collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     pub fn uniswap(&self, chain_id: u64) -> Result<&UniswapV3, Refusal> {
         self.uniswap.get(&chain_id).ok_or_else(|| {
             Refusal::new(RefusalCode::NoRoute, format!("no swap router configured for chain {chain_id}"))

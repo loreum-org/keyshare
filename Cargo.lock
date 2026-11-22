@@ -3196,7 +3196,6 @@ name = "keyshare-core"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
@@ -3205,13 +3204,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyshare-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "keyshare-module",
+ "reqwest 0.13.5",
+ "rmp-serde",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "keyshare-mcp"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "async-trait",
  "axum",
  "http 1.5.0",
  "keyshare-core",
+ "keyshare-hyperliquid",
+ "keyshare-module",
+ "keyshare-uniswap",
  "reqwest 0.13.5",
  "rmcp",
  "serde",
@@ -3222,6 +3242,30 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+]
+
+[[package]]
+name = "keyshare-module"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "keyshare-core",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "keyshare-uniswap"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "keyshare-module",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

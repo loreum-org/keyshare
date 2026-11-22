@@ -23,7 +23,7 @@ use crate::auth::Caller;
 use crate::chain;
 use crate::exec::{Executor, Outcome, RequestState, now, scoped, usd};
 use crate::hl::{Hyperliquid, OrderSpec};
-use crate::swap::{self, SwapRequest};
+use keyshare_uniswap::SwapRequest;
 
 sol! { function transfer(address to, uint256 amount); }
 
@@ -229,6 +229,17 @@ impl KeyshareServer {
             .ok_or_else(|| refused("", Refusal::new(RefusalCode::MarketNotAllowed, "Hyperliquid is not configured")))
     }
 
+    fn tool_visible(&self, caller: Option<&str>, name: &str) -> bool {
+        let Some(module) = self.exec.registry().module_for_tool(name) else {
+            return true;
+        };
+        match caller {
+            Some(bot) => self.exec.module_enabled(bot, module),
+            // No authenticated bot: do not advertise module tools.
+            None => false,
+        }
+    }
+
     async fn submit(
         &self,
         caller: String,
@@ -275,8 +286,10 @@ impl KeyshareServer {
             Ok(v) => v,
             Err(r) => return Ok(refused("", r)),
         };
-        if let Some(hl) = self.exec.hl.as_deref()
-            && let Some(floor) = hl.floor_for_limits(&self.exec, &bot).await
+        // Core caps are already in `v`. Each enabled module adds its own usage under its key.
+        if self.exec.module_enabled(&bot, keyshare_hyperliquid::MODULE_ID)
+            && let Some(hl) = self.exec.hl.as_deref()
+            && let Some(floor) = hl.floor_for_limits(self.exec.as_ref(), &bot).await
         {
             v["hyperliquid"] = floor;
         }
@@ -434,7 +447,7 @@ impl KeyshareServer {
             route_provider: args.route_provider,
             dry_run: args.dry_run,
         };
-        swap::swap(&self.exec, &caller, &id, req).await.map(to_result).map_err(internal)
+        keyshare_uniswap::swap(self.exec.as_ref(), &caller, &id, req).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -518,7 +531,7 @@ impl KeyshareServer {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
-        Ok(to_result(hl.positions(&self.exec, &caller).await))
+        Ok(to_result(hl.positions(self.exec.as_ref(), &caller).await))
     }
 
     #[tool(
@@ -535,7 +548,7 @@ impl KeyshareServer {
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.place_order(&self.exec, &caller, &id, args.order).await.map(to_result).map_err(internal)
+        hl.place_order(self.exec.as_ref(), &caller, &id, args.order).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -552,7 +565,7 @@ impl KeyshareServer {
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.modify(&self.exec, &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
+        hl.modify(self.exec.as_ref(), &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -569,7 +582,7 @@ impl KeyshareServer {
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.cancel(&self.exec, &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
+        hl.cancel(self.exec.as_ref(), &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -586,15 +599,56 @@ impl KeyshareServer {
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.set_leverage(&self.exec, &caller, &id, &args.coin, args.leverage, args.is_cross)
+        hl.set_leverage(self.exec.as_ref(), &caller, &id, &args.coin, args.leverage, args.is_cross)
             .await
             .map(to_result)
             .map_err(internal)
     }
 }
 
+fn caller_from(ctx: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<String> {
+    ctx.extensions.get::<http::request::Parts>().and_then(|parts| parts.extensions.get::<Caller>().map(|c| c.0.clone()))
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KeyshareServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let supports_cache_hints =
+            context.protocol_version().is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let caller = caller_from(&context);
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| self.tool_visible(caller.as_deref(), tool.name.as_ref()))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let caller = caller_from(&context);
+        if !self.tool_visible(caller.as_deref(), request.name.as_ref()) {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "keyshare wallet. Every signature is checked against this bot's policy and logged. \
