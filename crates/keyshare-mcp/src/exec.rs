@@ -185,6 +185,11 @@ impl Executor {
         gate.check(&loaded.reference).map_err(|e| e.to_string())?;
         let set = Arc::new(loaded.set);
         let hl_policies = set.hyperliquid()?;
+        let prices = set.price_table()?;
+        // Record the version before anything switches over. If the record can't be written, the
+        // old rules stay in force everywhere, and the next reload tries again cleanly instead of
+        // running new rules under the old hash.
+        gate.record(&loaded.reference).map_err(|e| e.to_string())?;
         let reference = loaded.reference;
         let signer = loaded.signer;
         let for_wallet = set.clone();
@@ -194,7 +199,6 @@ impl Executor {
                 let own = w.address(bot).ok();
                 engines.insert(bot.clone(), Box::new(PlainPolicy { own_address: own, ..rules.core.clone() }));
             }
-            let prices = for_wallet.price_table()?;
             let detail = json!({ "version": reference.version, "hash": reference.hash, "signed_by": signer });
             w.apply_policy(reference, engines, Box::new(prices), detail, now())
         })
@@ -204,7 +208,6 @@ impl Executor {
         }
         *self.modules.write().unwrap_or_else(|e| e.into_inner()) = set.modules();
         *self.tokens.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set.prices.clone());
-        gate.record(&reference).map_err(|e| e.to_string())?;
         *self.active.write().unwrap_or_else(|e| e.into_inner()) =
             Some(ActivePolicy { reference, signer, loaded_at: now(), set });
         *self.last_rejected.lock().unwrap_or_else(|e| e.into_inner()) = None;
