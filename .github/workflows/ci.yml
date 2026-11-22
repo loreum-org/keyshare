@@ -22,6 +22,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all --locked
+      # The core and module crates must build without the connector's key code (docs/modules.md).
+      - run: cargo check --locked --lib -p keyshare-core -p keyshare-module -p keyshare-hyperliquid -p keyshare-uniswap
 
   audit:
     runs-on: ubuntu-latest

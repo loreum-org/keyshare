@@ -99,8 +99,8 @@ fn kill(path: &str, bot: Option<&str>, on: bool) -> Result<()> {
 
 async fn approve_agent(path: &str, bot: &str, hours: u64) -> Result<()> {
     let config = Config::load(path.as_ref())?;
-    let file = hl::approve_agent(&config, bot, hours, |var| std::env::var(var).ok()).await?;
-    println!("approved agent {} until {} (unix ms)", file.address, file.valid_until_ms);
-    println!("saved to {}", hl::agent_path(&config.server.state_dir, bot).display());
+    let saved = hl::approve_agent(&config, bot, hours, |var| std::env::var(var).ok()).await?;
+    println!("approved agent {} until {} (unix ms)", saved.address, saved.valid_until_ms);
+    println!("saved to {}", saved.path.display());
     Ok(())
 }

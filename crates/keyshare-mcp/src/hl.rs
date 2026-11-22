@@ -2,32 +2,24 @@
 //! The owner command signs the bot wallet key here. Bot tools sign through
 //! [`keyshare_hyperliquid::HlHost::sign_l1`] on the executor.
 
-pub use keyshare_hyperliquid::{AgentFile, HlConfig, Hyperliquid, OrderSpec, agent_path, check_api_url, now_ms};
+pub use keyshare_hyperliquid::{HlConfig, Hyperliquid, OrderSpec, check_api_url, now_ms};
+pub use keyshare_signer::agent::{SavedAgent, path as agent_path};
 
-use keyshare_core::{LocalSigner, Refusal, RefusalCode, Signer};
-use keyshare_hyperliquid::agent_expired;
+use keyshare_core::{Refusal, RefusalCode, Signer};
+use keyshare_signer::LocalSigner;
+use keyshare_signer::agent::{self, NewAgent};
 
 use crate::config::Config;
 
 /// Loads the agent key the owner approved. Only the connector does this; the module asks
-/// [`keyshare_hyperliquid::HlHost::sign_l1`] and never sees the key bytes.
+/// [`keyshare_hyperliquid::HlHost::sign_l1`] and never sees the key bytes or the file.
 pub(crate) fn open_agent(hl: &Hyperliquid, bot: &str) -> Result<LocalSigner, Refusal> {
-    let none = |why: &str| {
+    agent::open(hl.state_dir(), bot, now_ms()).map_err(|e| {
         Refusal::new(
             RefusalCode::NoAgentKey,
-            format!("{why}; the owner runs `keyshare-mcp hl-approve-agent <config> {bot}`"),
+            format!("{}; the owner runs `keyshare-mcp hl-approve-agent <config> {bot}`", e.reason()),
         )
-    };
-    let text = std::fs::read_to_string(hl.agent_path_for(bot)).map_err(|_| none("no agent key"))?;
-    let file: AgentFile = serde_json::from_str(&text).map_err(|_| none("agent key file is unreadable"))?;
-    if agent_expired(file.valid_until_ms, now_ms()) {
-        return Err(none("agent key has expired"));
-    }
-    let signer = LocalSigner::from_hex(&file.key).map_err(|_| none("agent key file is unreadable"))?;
-    if signer.address() != file.address {
-        return Err(none("agent key does not match its address"));
-    }
-    Ok(signer)
+    })
 }
 
 pub async fn approve_agent(
@@ -35,7 +27,7 @@ pub async fn approve_agent(
     bot: &str,
     hours: u64,
     env: impl Fn(&str) -> Option<String>,
-) -> Result<AgentFile, String> {
+) -> Result<SavedAgent, String> {
     let cfg = config.bots.get(bot).ok_or_else(|| format!("no bot {bot} in the config"))?;
     if cfg.hyperliquid.is_none() {
         return Err(format!("bot {bot} has no [bots.{bot}.hyperliquid] table"));
@@ -43,13 +35,15 @@ pub async fn approve_agent(
     let key = env(&cfg.key_env).ok_or_else(|| format!("{} is not set", cfg.key_env))?;
     let master = LocalSigner::from_hex(&key).map_err(|e| e.to_string())?;
     let venue = config.hyperliquid().map_err(|e| e.to_string())?;
-    keyshare_hyperliquid::approve_agent(
+    let agent = NewAgent::generate()?;
+    let approved = keyshare_hyperliquid::approve_agent(
         &venue,
         bot,
+        agent.address(),
         hours,
-        &config.server.state_dir,
         &config.state_paths().kill_switch,
         move |data| master.sign_typed_data(data).map_err(|e| e.to_string()),
     )
-    .await
+    .await?;
+    agent.save(&config.server.state_dir, bot, approved.name, approved.valid_until_ms)
 }

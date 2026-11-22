@@ -10,7 +10,7 @@ The signing path, with no network code and no venue logic. Everything here will 
 |---|---|
 | `wallet.rs` | The one path every signature goes through: audit, caller, kill switch, anchor check, request id, policy, record spend, sign, audit. |
 | `policy.rs` | The policy rules and checks (`PlainPolicy`). `PolicyEngine` is the trait a later proof-based check can plug into. |
-| `signer.rs` | The `Signer` trait and `LocalSigner` (one testnet key). Every method takes the full payload, never a bare hash. |
+| `signer.rs` | The `Signer` trait. Every method takes the full payload, never a bare hash. Nothing here loads a key or builds a signer. |
 | `spend.rs` | Spend log, used request ids, rollback anchor. |
 | `chainlog.rs` | The hash-chained JSON-lines file used by the spend and audit logs. |
 | `audit.rs` | Audit log entries. |
@@ -21,6 +21,10 @@ The signing path, with no network code and no venue logic. Everything here will 
 | `lib.rs` | Exports. |
 
 Tests: `tests/wallet.rs`, plus unit tests in each file.
+
+## keyshare-signer
+
+Key material. `LocalSigner` (one testnet key) and the Hyperliquid agent key file: where it lives, writing it with mode 0600, and loading it with the expiry and address checks. Only `keyshare-mcp` depends on this crate; `tests/boundary.rs` fails if any other crate does.
 
 ## keyshare-module
 

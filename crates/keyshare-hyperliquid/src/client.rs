@@ -16,10 +16,10 @@ use crate::protocol::{
     CancelWire, HlPolicy, L1Action, LimitWire, ModifyWire, OrderCheck, OrderTypeWire, OrderWire, Tif, Tpsl, TriggerWire,
 };
 use alloy::dyn_abi::TypedData;
-use alloy::primitives::{Address, B256, Signature};
+use alloy::primitives::{Address, Signature};
 use keyshare_core::audit::AuditEvent;
 use keyshare_core::killswitch::KillSwitch;
-use keyshare_core::{LocalSigner, Refusal, RefusalCode, Signer};
+use keyshare_core::{Refusal, RefusalCode};
 use keyshare_module::ModuleView;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -54,15 +54,6 @@ pub const TESTNET_API: &str = "https://api.hyperliquid-testnet.xyz";
 pub const HYPERLIQUID_TOOLS: &[&str] = &["hl_positions", "hl_place_order", "hl_modify", "hl_cancel", "hl_set_leverage"];
 /// Phase 0 is testnet only: every signature says so.
 const MAINNET: bool = false;
-/// An agent this close to expiry is treated as expired, so an order never races the cutoff.
-const EXPIRY_MARGIN_MS: u64 = 60_000;
-
-/// Whether the connector should refuse to load this agent key. The margin is part of the venue
-/// rule; the connector owns the file and the key bytes.
-pub fn agent_expired(valid_until_ms: u64, now_ms: u64) -> bool {
-    valid_until_ms <= now_ms.saturating_add(EXPIRY_MARGIN_MS)
-}
-
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -72,16 +63,6 @@ pub fn now_ms() -> u64 {
 pub struct HlConfig {
     /// Default: Hyperliquid testnet.
     pub api_url: Option<String>,
-}
-
-/// The agent key file `hl-approve-agent` writes (mode 0600). A new key every time: an agent
-/// address is never reused (design §8).
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AgentFile {
-    pub address: Address,
-    pub key: String,
-    pub name: String,
-    pub valid_until_ms: u64,
 }
 
 /// Phase 0 signs for testnet only, so refuse any other API host up front. Loopback is allowed
@@ -108,10 +89,6 @@ pub fn check_api_url(config: Option<&HlConfig>) -> Result<(), String> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost");
     if host == "api.hyperliquid-testnet.xyz" && https || loopback { Ok(()) } else { Err(bad()) }
-}
-
-pub fn agent_path(state_dir: &Path, bot: &str) -> PathBuf {
-    state_dir.join("hyperliquid").join(format!("{bot}.agent.json"))
 }
 
 fn day_path(state_dir: &Path, bot: &str) -> PathBuf {
@@ -602,8 +579,10 @@ impl Hyperliquid {
     }
 
     /// Where the connector stores this bot's agent key. The module does not read that file.
-    pub fn agent_path_for(&self, bot: &str) -> PathBuf {
-        agent_path(&self.state_dir, bot)
+    /// Where this module keeps its day-start and equity files. The connector also keeps the agent
+    /// key under it, but this crate never builds that path or reads that file.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
     /// Master address (queries use it, not the agent's) after the kill switch.
@@ -1080,27 +1059,31 @@ fn refusal_json(id: &str, r: &Refusal) -> Value {
     v
 }
 
-/// Generates a brand-new agent key, has the bot's wallet key (the master) approve it on
-/// Hyperliquid testnet, and saves it where the server reads it. Run by the owner, not a bot.
-/// An agent address is never reused (design §8).
-/// Owner command. The connector signs the master (wallet) key and passes the signature in;
-/// this crate never loads that key. This does not run on the bot tool path.
+/// An agent approval Hyperliquid accepted. The connector saves the key under this name.
+#[derive(Debug, Clone)]
+pub struct ApprovedAgent {
+    pub name: String,
+    pub valid_until_ms: u64,
+}
+
+/// Has the bot's wallet key (the master) approve `agent` on Hyperliquid testnet. Run by the
+/// owner, not a bot. The connector generates the agent key, signs the master key, and saves the
+/// agent key after this returns; this crate never sees either key. An agent address is never
+/// reused (design §8).
 pub async fn approve_agent(
     venue: &Hyperliquid,
     bot: &str,
+    agent: Address,
     hours: u64,
-    state_dir: &Path,
     kill_switch: &Path,
     sign_master: impl FnOnce(&TypedData) -> Result<Signature, String>,
-) -> Result<AgentFile, String> {
+) -> Result<ApprovedAgent, String> {
     KillSwitch::new(kill_switch).check(bot).map_err(|r| r.reason)?;
-    let agent_key = B256::random().to_string();
-    let agent = LocalSigner::from_hex(&agent_key).map_err(|e| e.to_string())?;
     let nonce = now_ms();
     let valid_until_ms = nonce + hours * 3_600_000;
     // Hyperliquid reads an agent's expiry from this suffix on its name.
     let name = format!("keyshare-{bot} valid_until {valid_until_ms}");
-    let (action, data) = hl::approve_agent(agent.address(), &name, nonce, MAINNET);
+    let (action, data) = hl::approve_agent(agent, &name, nonce, MAINNET);
     let sig = sign_master(&data)?;
     let body = json!({
         "action": action,
@@ -1113,29 +1096,7 @@ pub async fn approve_agent(
     if resp["status"] != "ok" {
         return Err(format!("Hyperliquid refused the agent: {resp}"));
     }
-    let file = AgentFile { address: agent.address(), key: agent_key, name, valid_until_ms };
-    let text = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
-    write_private(&agent_path(state_dir, bot), &text).map_err(|e| e.to_string())?;
-    Ok(file)
-}
-
-/// Writes a file only its owner can read, replacing any old one.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    // A stale tmp file could carry looser permissions; start fresh so mode 0600 applies.
-    match std::fs::remove_file(&tmp) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    Ok(ApprovedAgent { name, valid_until_ms })
 }
 
 #[cfg(test)]

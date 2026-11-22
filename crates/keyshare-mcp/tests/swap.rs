@@ -13,10 +13,11 @@ use alloy::sol_types::SolCall;
 use axum::body::Body;
 use axum::{Json, Router};
 use http::Request;
-use keyshare_core::{LocalSigner, Signer};
+use keyshare_core::Signer;
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
 use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
+use keyshare_signer::LocalSigner;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 

@@ -507,14 +507,25 @@ pub fn action_assets(action: &L1Action) -> Vec<u32> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use keyshare_core::{LocalSigner, Signer};
+    use alloy::signers::SignerSync;
+    use alloy::signers::local::PrivateKeySigner;
 
     /// The SDK's test key.
     const KEY: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";
 
+    /// Test-only signing. `signer-local` is a dev-dependency feature here: the module itself
+    /// cannot name a key type (docs/modules.md).
+    fn sign_typed(key: &PrivateKeySigner, data: &TypedData) -> Signature {
+        key.sign_hash_sync(&data.eip712_signing_hash().unwrap()).unwrap()
+    }
+
+    fn master() -> PrivateKeySigner {
+        KEY.parse().unwrap()
+    }
+
     fn sign_l1<T: Serialize>(action: &T, nonce: u64, mainnet: bool) -> serde_json::Value {
         let hash = action_hash(action, None, nonce, None).unwrap();
-        let sig = LocalSigner::from_hex(KEY).unwrap().sign_typed_data(&l1_typed_data(hash, mainnet)).unwrap();
+        let sig = sign_typed(&master(), &l1_typed_data(hash, mainnet));
         signature_json(&sig)
     }
 
@@ -652,7 +663,7 @@ mod tests {
             &[("hyperliquidChain", "string"), ("destination", "string"), ("amount", "string"), ("time", "uint64")],
             msg,
         );
-        let sig = LocalSigner::from_hex(KEY).unwrap().sign_typed_data(&data).unwrap();
+        let sig = sign_typed(&master(), &data);
         assert_eq!(
             signature_json(&sig),
             rsv(
@@ -665,12 +676,12 @@ mod tests {
 
     #[test]
     fn approve_agent_recovers_to_master() {
-        let master = LocalSigner::from_hex(KEY).unwrap();
-        let agent = LocalSigner::random().address();
+        let master = master();
+        let agent = PrivateKeySigner::random().address();
         let (action, data) = approve_agent(agent, "keyshare-filltape", 1, false);
         assert_eq!(action["hyperliquidChain"], "Testnet");
         assert_eq!(action["signatureChainId"], "0x66eee");
-        let sig = master.sign_typed_data(&data).unwrap();
+        let sig = sign_typed(&master, &data);
         let hash = data.eip712_signing_hash().unwrap();
         assert_eq!(sig.recover_address_from_prehash(&hash).unwrap(), master.address());
     }

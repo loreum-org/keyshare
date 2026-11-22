@@ -17,6 +17,7 @@ Documentation of what is built: [docs/README.md](docs/README.md). Full design: [
 | Crate | What it does |
 |---|---|
 | `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path. No venue code. |
+| `crates/keyshare-signer` | Key loading: the single testnet key and the Hyperliquid agent key file. Only the connector depends on it. |
 | `crates/keyshare-module` | Intents and grants. The core re-checks every module intent before it signs. |
 | `crates/keyshare-hyperliquid` | Hyperliquid testnet orders. The core signs them with the bot's agent key. |
 | `crates/keyshare-uniswap` | Uniswap v3 swaps. The core signs the approve and the swap. |

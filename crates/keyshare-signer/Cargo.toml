@@ -1,0 +1,20 @@
+[package]
+name = "keyshare-signer"
+description = "Key loading and signer construction for keyshare. Only the connector depends on this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+
+[dependencies]
+alloy = { workspace = true, features = ["signer-local"] }
+keyshare-core = { path = "../keyshare-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

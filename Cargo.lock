@@ -3230,6 +3230,7 @@ dependencies = [
  "keyshare-core",
  "keyshare-hyperliquid",
  "keyshare-module",
+ "keyshare-signer",
  "keyshare-uniswap",
  "reqwest 0.13.5",
  "rmcp",
@@ -3250,6 +3251,17 @@ dependencies = [
  "alloy",
  "keyshare-core",
  "serde_json",
+]
+
+[[package]]
+name = "keyshare-signer"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
