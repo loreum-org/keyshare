@@ -2,11 +2,15 @@
 
 A threshold-signing wallet for humans and agents. The signing key is a plain EOA from a 2-of-3 distributed key generation, so the full private key never exists. Each signer node enforces policy in plain Rust. ZK proofs are a later option, not part of v1. There is no Safe or smart-account layer.
 
-**Status:** Phase 0 (testnet MVP) built: one key per bot, testnet only. Not yet tested on a live network. Design draft v0.1 (Oct 18, 2026).
+## Status and disclaimers
 
-**License:** TBD
+**Status:** Phase 0 (testnet MVP). One key per bot, testnet only. Not yet tested on a live network. The 2-of-3 threshold design is a draft (v0.1, October 18, 2026) and is not what this code does today.
 
-Documentation of what is built: [docs/README.md](docs/README.md). Full design: [docs/design.md](docs/design.md).
+keyshare is experimental and has not been independently audited. It is not a production wallet. Do not put real funds behind it.
+
+Licensed under the Apache License 2.0, without warranty of any kind. See [LICENSE](LICENSE), [NOTICE](NOTICE), and [SECURITY.md](SECURITY.md).
+
+Documentation of what is built: [docs/README.md](docs/README.md). Full design: [docs/design.md](docs/design.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Code
 

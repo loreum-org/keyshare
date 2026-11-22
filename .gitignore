@@ -18,9 +18,18 @@ build/
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 *.share
 *.keyshare
+*.mnemonic
 keystore/
+id_rsa
+id_ed25519
+id_ecdsa
+UTC--*
 
 # OS / editor
 .DS_Store
