@@ -3,13 +3,44 @@
 use std::collections::HashMap;
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy::dyn_abi::TypedData;
 use alloy::eips::Decodable2718;
+use alloy::primitives::Signature;
 use alloy::primitives::{Address, Bytes, TxKind, U256, address};
+use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use keyshare_core::approval::{Decision, intent_hash, message};
 use keyshare_core::price::PriceEntry;
-use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, RefusalCode, Signer, StatePaths, Wallet};
+use keyshare_core::signer::SignerError;
+use keyshare_core::{Account, PlainPolicy, PriceTable, RefusalCode, Signer, StatePaths, Wallet};
+
+/// A test key. The core has no signer constructor of its own; `keyshare-signer` does, and only
+/// the connector depends on it.
+struct LocalSigner(PrivateKeySigner);
+
+impl LocalSigner {
+    fn random() -> Self {
+        Self(PrivateKeySigner::random())
+    }
+}
+
+impl Signer for LocalSigner {
+    fn address(&self) -> Address {
+        self.0.address()
+    }
+    fn sign_transaction(&self, tx: &TxEip1559) -> Result<Signature, SignerError> {
+        self.0.sign_hash_sync(&tx.signature_hash()).map_err(|e| SignerError::Failed(e.to_string()))
+    }
+    fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
+        self.0.sign_message_sync(message).map_err(|e| SignerError::Failed(e.to_string()))
+    }
+    fn sign_typed_data(&self, data: &TypedData) -> Result<Signature, SignerError> {
+        let hash = data.eip712_signing_hash().map_err(|e| SignerError::Failed(e.to_string()))?;
+        self.0.sign_hash_sync(&hash).map_err(|e| SignerError::Failed(e.to_string()))
+    }
+}
 
 sol! { function transfer(address to, uint256 amount); }
 

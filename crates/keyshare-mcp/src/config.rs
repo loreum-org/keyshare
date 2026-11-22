@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
 use keyshare_core::price::PriceEntry;
-use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
+use keyshare_core::{Account, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
 use keyshare_hyperliquid::HlPolicy;
+use keyshare_signer::LocalSigner;
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;

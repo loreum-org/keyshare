@@ -49,15 +49,16 @@ pub fn verify(admins: &[Address], message: &str, signature: &Signature) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signer::{LocalSigner, Signer};
     use alloy::primitives::{TxKind, U256};
+    use alloy::signers::SignerSync;
+    use alloy::signers::local::PrivateKeySigner;
 
     #[test]
     fn approval_is_bound_to_request_and_intent() {
-        let admin = LocalSigner::random();
+        let admin = PrivateKeySigner::random();
         let tx = TxEip1559 { chain_id: 1, to: TxKind::Call(Address::ZERO), value: U256::from(5), ..Default::default() };
         let msg = message(Decision::Approve, "filltape", "r1", intent_hash(&tx));
-        let sig = admin.sign_message(msg.as_bytes()).unwrap();
+        let sig = admin.sign_message_sync(msg.as_bytes()).unwrap();
         assert_eq!(verify(&[admin.address()], &msg, &sig).unwrap(), admin.address());
 
         // Same signature, different request, decision or tx: refused.
@@ -70,6 +71,6 @@ mod tests {
         ] {
             assert!(verify(&[admin.address()], &m, &sig).is_err());
         }
-        assert!(verify(&[LocalSigner::random().address()], &msg, &sig).is_err());
+        assert!(verify(&[PrivateKeySigner::random().address()], &msg, &sig).is_err());
     }
 }

@@ -9,11 +9,12 @@ use alloy::primitives::{Address, Bytes, Signature, keccak256};
 use axum::Router;
 use axum::body::Body;
 use http::{Request, StatusCode};
+use keyshare_core::Signer;
 use keyshare_core::Wallet;
-use keyshare_core::{LocalSigner, Signer};
 use keyshare_mcp::auth::{Credentials, token_hash};
 use keyshare_mcp::config::Config;
 use keyshare_mcp::exec::{DEFAULT_HOLD_SECS, Executor};
+use keyshare_signer::LocalSigner;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
