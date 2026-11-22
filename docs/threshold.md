@@ -31,7 +31,7 @@ With this setup the co-signer runs **inside the connector**. It does its own pol
 keyshare-mcp threshold-refresh ./keys/share.json ./keys/cosigner.share.json
 ```
 
-This replaces both shares with new random ones for the **same address**, so no funds move. An old share does not work with a new one, so a share that leaked before the refresh is useless after it. Stop the server first, and back up both new files.
+This replaces both shares with new random ones for the **same address**, so no funds move. An old share does not work with a new one, so a share that leaked before the refresh is useless after it. Stop the server first (a running server keeps the old shares in memory), and back up both new files. If the second file can't be replaced, the command says so and leaves the new co-signer share next to it as `.new`; move it into place by hand, since a new bot share and an old co-signer share don't combine.
 
 **Backup.** Losing either share loses the wallet. Keep an encrypted copy of each share in a different place. Never keep both copies together, or the backup is the full key.
 
@@ -57,9 +57,10 @@ On testnet this is cheap. The old address's history stays with the old address. 
 
 Other limits:
 
-- **Spend counts at the start.** The co-signer records a request's spend before signing finishes. A request that fails part-way still counts toward the daily cap. This errs on the safe side.
-- **Unfinished sessions** expire after 60 seconds, and a co-signer keeps at most 64 open.
-- **A cheating counterparty is banned.** If the protocol detects the other party misbehaving in a way that could leak key material, the co-signer refuses all further signing until it is restarted with fresh shares.
+- **Spend counts at the start.** The co-signer uses up the request id and records the spend before the signing rounds run. A request that then fails part-way (a dropped connection, a protocol error) still counts toward the daily cap, and its request id can't be reused: retry with a new one. This errs on the safe side.
+- **Unfinished sessions** expire after 60 seconds (a late `finish` is refused), and a co-signer keeps at most 64 open.
+- **A cheating counterparty is banned.** If the protocol detects the other party misbehaving in a way that could leak key material, the co-signer refuses all further signing. The ban is saved next to its spend log (`<bot>.spend.banned`), so a restart doesn't clear it. Make a new key and move the funds.
+- **Where the co-signer's policy comes from.** The in-process co-signer is handed the policy the connector verified. A co-signer on another machine must verify the owner's signature on the policy file itself.
 - **The wallet checks the result.** The connector only returns a signature that recovers to the wallet's address.
 
 ## Library

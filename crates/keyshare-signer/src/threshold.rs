@@ -98,6 +98,18 @@ impl KeyShare {
         crate::agent::write_private(path, &bytes).map_err(|e| ThresholdError::File(e.to_string()))
     }
 
+    /// Like [`KeyShare::save`], but refuses if `path` already exists, so a new key never
+    /// replaces a share that might still hold funds.
+    pub fn save_new(&self, path: &Path) -> Result<(), ThresholdError> {
+        let file = |e: std::io::Error| ThresholdError::File(format!("{}: {e}", path.display()));
+        let staging = path.with_extension("staging");
+        self.save(&staging)?;
+        // hard_link fails if the target exists; rename would overwrite it.
+        let linked = std::fs::hard_link(&staging, path);
+        let _ = std::fs::remove_file(&staging);
+        linked.map_err(file)
+    }
+
     pub fn load(path: &Path) -> Result<Self, ThresholdError> {
         let bytes = std::fs::read(path).map_err(|e| ThresholdError::File(format!("{}: {e}", path.display())))?;
         let share: Self = serde_json::from_slice(&bytes).map_err(|e| ThresholdError::File(e.to_string()))?;
@@ -406,8 +418,10 @@ struct CoState {
     policy: Option<CoSignerPolicy>,
     spend: SpendLog,
     sessions: HashMap<B256, OpenSession>,
-    /// Set when the bot side sent a message that leaks OT state if answered again. Permanent.
+    /// Set when the bot side sent a message that leaks OT state if answered again. Kept in
+    /// `ban_file` so a restart doesn't clear it; only new shares (a fresh key) start clean.
     banned: bool,
+    ban_file: std::path::PathBuf,
 }
 
 /// A co-signer in this process, with its own share, policy and spend counter.
@@ -428,7 +442,10 @@ impl LocalCoSigner {
             return Err(ThresholdError::Mismatch("the co-signer holds share 2".into()));
         }
         let spend = SpendLog::open(spend_log, None).map_err(|e| ThresholdError::File(e.to_string()))?;
-        Ok(Self { share, state: Mutex::new(CoState { policy: None, spend, sessions: HashMap::new(), banned: false }) })
+        let ban_file = spend_log.with_extension("banned");
+        let banned = ban_file.exists();
+        let state = CoState { policy: None, spend, sessions: HashMap::new(), banned, ban_file };
+        Ok(Self { share, state: Mutex::new(state) })
     }
 
     /// Swaps in a newly signed policy the co-signer verified itself.
@@ -443,6 +460,8 @@ impl LocalCoSigner {
     fn on_abort(state: &mut CoState, a: &Abort) -> Refusal {
         if matches!(a.kind, AbortKind::BanCounterparty(_)) {
             state.banned = true;
+            // Best effort: the in-memory ban holds regardless.
+            let _ = std::fs::write(&state.ban_file, abort_text(a));
         }
         refuse(RefusalCode::ThresholdUnavailable, abort_text(a))
     }
@@ -534,6 +553,12 @@ impl CoSigner for LocalCoSigner {
         let Some(open) = state.sessions.remove(&sign_id) else {
             return Err(refuse(RefusalCode::BadArgs, "no open signing session with that id"));
         };
+        if now().saturating_sub(open.opened) >= SESSION_TTL_SECS {
+            return Err(refuse(RefusalCode::Expired, "signing session expired"));
+        }
+        if state.banned {
+            return Err(refuse(RefusalCode::ThresholdUnavailable, "co-signer has banned this counterparty"));
+        }
         match self.share.party.sign_phase3(&open.data, open.unique, open.kept, &round2) {
             Ok((_, broadcast)) => Ok(broadcast),
             Err(a) => Err(Self::on_abort(&mut state, &a)),

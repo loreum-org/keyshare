@@ -131,8 +131,8 @@ fn threshold_keygen(dir: &Path) -> Result<()> {
             return Err(format!("{} already exists; not overwriting a key share", path.display()).into());
         }
     }
-    share.save(&a)?;
-    co.save(&b)?;
+    share.save_new(&a)?;
+    co.save_new(&b)?;
     println!(
         "address: {}
 bot share:       {}
@@ -159,8 +159,21 @@ fn threshold_refresh(share_path: &Path, co_path: &Path) -> Result<()> {
     share2.save(&tmp_a)?;
     co2.save(&tmp_b)?;
     std::fs::rename(&tmp_a, share_path)?;
-    std::fs::rename(&tmp_b, co_path)?;
-    println!("refreshed both shares; address unchanged: {}", share2.address());
+    if let Err(e) = std::fs::rename(&tmp_b, co_path) {
+        return Err(format!(
+            "{} now holds the new bot share but {} could not be replaced ({e}). The two don't \
+             combine. Move {} over {} by hand before starting the server.",
+            share_path.display(),
+            co_path.display(),
+            tmp_b.display(),
+            co_path.display()
+        )
+        .into());
+    }
+    println!(
+        "refreshed both shares; address unchanged: {}\nrestart the server: it keeps the old shares in memory until then",
+        share2.address()
+    );
     Ok(())
 }
 

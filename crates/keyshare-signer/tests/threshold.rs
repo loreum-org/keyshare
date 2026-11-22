@@ -258,4 +258,11 @@ fn share_files_round_trip_privately() {
     assert_eq!(loaded.address(), bot.address());
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // A new key never replaces an existing share file.
+    let fresh = dir.path().join("fresh.share.json");
+    bot.save_new(&fresh).unwrap();
+    assert!(bot.save_new(&fresh).is_err());
+    assert!(bot.save_new(&path).is_err());
+    assert_eq!(KeyShare::load(&path).unwrap().address(), bot.address());
 }
