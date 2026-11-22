@@ -18,12 +18,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
-use crate::config::Config;
+use crate::config::{CoSigners, Config};
 use crate::hl::Hyperliquid;
 use crate::policy::{self, LoadedPolicy, ModuleToggles};
 use keyshare_core::PlainPolicy;
 use keyshare_core::policy::PolicyEngine;
 use keyshare_core::policy_file::{PolicyRef, VersionGate};
+use keyshare_signer::threshold::CoSignerPolicy;
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
 pub const DEFAULT_HOLD_SECS: u64 = 15 * 60;
@@ -94,6 +95,8 @@ pub struct Executor {
     /// then never sign.
     requests: Mutex<HashMap<String, Request>>,
     hold_secs: u64,
+    /// In-process co-signers of threshold bots. Each gets every newly loaded policy.
+    cosigners: CoSigners,
 }
 
 /// The signed policy in force, as the `policy` tool reports it.
@@ -149,7 +152,13 @@ impl Executor {
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
+            cosigners: CoSigners::new(),
         }
+    }
+
+    pub fn with_cosigners(mut self, cosigners: CoSigners) -> Self {
+        self.cosigners = cosigners;
+        self
     }
 
     pub fn with_hyperliquid(mut self, hl: Hyperliquid) -> Self {
@@ -187,6 +196,25 @@ impl Executor {
         let hl_policies = set.hyperliquid()?;
         let reference = loaded.reference;
         let signer = loaded.signer;
+        // Build every co-signer's policy before anything switches, so a failure here leaves the
+        // whole server on the old policy rather than half-applied.
+        let mut cosigner_policies = Vec::new();
+        for (bot, (co, admins)) in &self.cosigners {
+            let policy = match set.bots.get(bot) {
+                Some(rules) => {
+                    let own = self.wallet.lock().unwrap_or_else(|e| e.into_inner()).address(bot).ok();
+                    Some(CoSignerPolicy {
+                        bot: bot.clone(),
+                        policy: reference,
+                        engine: Box::new(PlainPolicy { own_address: own, ..rules.core.clone() }),
+                        prices: Box::new(set.price_table()?),
+                        admins: admins.clone(),
+                    })
+                }
+                None => None,
+            };
+            cosigner_policies.push((co.clone(), policy));
+        }
         let for_wallet = set.clone();
         self.with_wallet(move |w| {
             let mut engines: HashMap<String, Box<dyn PolicyEngine>> = HashMap::new();
@@ -199,6 +227,12 @@ impl Executor {
             w.apply_policy(reference, engines, Box::new(prices), detail, now())
         })
         .await??;
+        for (co, policy) in cosigner_policies {
+            match policy {
+                Some(p) => co.set_policy(p),
+                None => co.clear_policy(),
+            }
+        }
         if let Some(hl) = &self.hl {
             hl.set_policies(hl_policies);
         }

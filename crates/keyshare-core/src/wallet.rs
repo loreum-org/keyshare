@@ -19,7 +19,7 @@ use crate::policy::{Action, PolicyEngine, Verdict};
 use crate::policy_file::PolicyRef;
 use crate::price::{PriceSource, UsdMicros};
 use crate::refusal::{Refusal, RefusalCode};
-use crate::signer::Signer;
+use crate::signer::{SignContext, Signer, SignerError};
 use crate::spend::{SpendEntry, SpendLog};
 
 /// One caller's wallet: its key and its rules. Design §11 Q1: one EOA per bot.
@@ -182,7 +182,7 @@ impl Wallet {
         now: u64,
     ) -> Result<SignedTx, Refusal> {
         let admin = self.verify_decision(caller, request_id, &tx, Decision::Approve, approval)?;
-        self.sign_tx_inner(caller, request_id, tx, Some(admin), now)
+        self.sign_tx_inner(caller, request_id, tx, Some((admin, *approval)), now)
     }
 
     fn sign_tx_inner(
@@ -190,9 +190,10 @@ impl Wallet {
         caller: &str,
         request_id: &str,
         tx: TxEip1559,
-        approved_by: Option<Address>,
+        approval: Option<(Address, Signature)>,
         now: u64,
     ) -> Result<SignedTx, Refusal> {
+        let approved_by = approval.map(|(a, _)| a);
         let from = self.accounts.get(caller).map(|a| a.signer.address());
         let detail = json!({
             "approved_by": approved_by,
@@ -206,10 +207,14 @@ impl Wallet {
             "digest": tx.signature_hash(),
             "tx": tx,
         });
-        let sig =
-            self.authorize_and_sign(caller, request_id, Action::Transaction(&tx), approved_by, detail, now, |s| {
-                s.sign_transaction(&tx)
-            })?;
+        let sig = self.authorize_and_sign(
+            caller,
+            request_id,
+            Action::Transaction(&tx),
+            approval.map(|(_, s)| s),
+            detail,
+            now,
+        )?;
         let envelope = TxEnvelope::from(tx.into_signed(sig));
         Ok(SignedTx { hash: *envelope.tx_hash(), raw: envelope.encoded_2718().into() })
     }
@@ -226,9 +231,7 @@ impl Wallet {
             "message": String::from_utf8_lossy(message),
             "message_hex": Bytes::copy_from_slice(message),
         });
-        self.authorize_and_sign(caller, request_id, Action::Message(message), None, detail, now, |s| {
-            s.sign_message(message)
-        })
+        self.authorize_and_sign(caller, request_id, Action::Message(message), None, detail, now)
     }
 
     pub fn sign_typed_data(
@@ -239,21 +242,17 @@ impl Wallet {
         now: u64,
     ) -> Result<Signature, Refusal> {
         let detail = json!({ "kind": "typed_data", "primary_type": data.primary_type, "typed_data": data });
-        self.authorize_and_sign(caller, request_id, Action::TypedData(data), None, detail, now, |s| {
-            s.sign_typed_data(data)
-        })
+        self.authorize_and_sign(caller, request_id, Action::TypedData(data), None, detail, now)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn authorize_and_sign(
         &mut self,
         caller: &str,
         request_id: &str,
         action: Action<'_>,
-        approved_by: Option<Address>,
+        owner_approval: Option<Signature>,
         detail: serde_json::Value,
         now: u64,
-        sign: impl FnOnce(&dyn Signer) -> Result<Signature, crate::signer::SignerError>,
     ) -> Result<Signature, Refusal> {
         let policy = self.policy;
         let entry = |event, detail| AuditEntry {
@@ -267,7 +266,7 @@ impl Wallet {
         // No audit entry, no signature.
         self.audit.append(&entry(AuditEvent::Requested, detail)).map_err(internal)?;
 
-        let checked = match self.authorize(caller, request_id, action, approved_by.is_some(), now) {
+        let checked = match self.authorize(caller, request_id, action, owner_approval.is_some(), now) {
             Ok(checked) => checked,
             Err((refusal, checked)) => {
                 let mut detail = json!(refusal);
@@ -281,14 +280,23 @@ impl Wallet {
         };
 
         let account = self.account(caller)?;
-        match sign(account.signer.as_ref()) {
+        let ctx = SignContext {
+            caller: caller.to_string(),
+            request_id: request_id.to_string(),
+            policy: self.policy,
+            owner_approval,
+        };
+        match account.signer.sign_with(&ctx, action) {
             Ok(sig) => {
                 let detail = json!({ "signature": sig, "policy_check": checked });
                 self.audit.append(&entry(AuditEvent::Signed, detail)).map_err(internal)?;
                 Ok(sig)
             }
             Err(e) => {
-                let refusal = Refusal::new(RefusalCode::ThresholdUnavailable, e.to_string());
+                let refusal = match e {
+                    SignerError::Refused(r) => Refusal::new(r.code, format!("co-signer: {}", r.reason)),
+                    e => Refusal::new(RefusalCode::ThresholdUnavailable, e.to_string()),
+                };
                 let _ = self.audit.append(&entry(AuditEvent::Refused, json!(refusal)));
                 Err(refusal)
             }

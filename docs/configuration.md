@@ -55,7 +55,8 @@ One section per bot, in the config. The name (e.g. `filltape`) is the bot's id i
 | Setting | Required | Meaning |
 |---|---|---|
 | `credential_sha256` | yes | Hash of the bot's login token. Two bots can't share a token. |
-| `key_env` | yes | Environment variable that holds the bot's private key. |
+| `key_env` | one of these | Environment variable that holds the bot's private key. |
+| `threshold` | one of these | A 2-of-2 threshold key instead: `share` and `cosigner_share`, the two files from `keyshare-mcp threshold-keygen`. See [Threshold signing](threshold.md). |
 | `admin_keys` | no | Owner addresses that can approve or deny this bot's held requests. With none, over-limit requests are simply refused. |
 
 ## Policy file

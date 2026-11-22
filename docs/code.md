@@ -25,7 +25,7 @@ Tests: `tests/wallet.rs`, plus unit tests in each file.
 
 ## keyshare-signer
 
-Key material. `LocalSigner` (one testnet key) and the Hyperliquid agent key file: where it lives, writing it with mode 0600, and loading it with the expiry and address checks. Only `keyshare-mcp` depends on this crate; `tests/boundary.rs` fails if any other crate does.
+Key material. `LocalSigner` (one testnet key), `threshold` (2-of-2 DKLs23: key generation, refresh, `ThresholdSigner` for the bot's share and `LocalCoSigner`, which re-checks the policy before it helps sign), and the Hyperliquid agent key file: where it lives, writing it with mode 0600, and loading it with the expiry and address checks. Only `keyshare-mcp` depends on this crate; `tests/boundary.rs` fails if any other crate does.
 
 ## keyshare-module
 

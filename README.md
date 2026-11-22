@@ -4,7 +4,7 @@ A threshold-signing wallet for humans and agents. The signing key is a plain EOA
 
 ## Status and disclaimers
 
-**Status:** Phase 0 (testnet MVP). One key per bot, testnet only. Not yet tested on a live network. The 2-of-3 threshold design is a draft (v0.1, October 18, 2026) and is not what this code does today.
+**Status:** Phase 0 (testnet MVP), testnet only. Not yet tested on a live network. A bot uses one private key, or a 2-of-2 threshold key whose co-signer re-checks the policy ([docs/threshold.md](docs/threshold.md)); the co-signer runs in the same process for now. The 2-of-3 design is a draft (v0.1, October 18, 2026).
 
 keyshare is experimental and has not been independently audited. It is not a production wallet. Do not put real funds behind it.
 

@@ -12,9 +12,14 @@ alloy = { workspace = true, features = ["signer-local"] }
 keyshare-core = { path = "../keyshare-core" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+# DKLs23 threshold ECDSA (0xCarbon). k256 0.14 is the version it is built on; only used to name the curve.
+dkls23 = { version = "0.6.2", default-features = false, features = ["secp256k1", "serde"] }
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

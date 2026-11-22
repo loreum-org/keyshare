@@ -91,5 +91,6 @@ A refused call returns `refused: true`, a `code`, a plain `reason`, and the `req
 | `NO_AGENT_KEY` | The bot has no valid Hyperliquid agent key. The owner needs to run `hl-approve-agent`. |
 | `VENUE_UNAVAILABLE` | Hyperliquid didn't answer or rejected the request. |
 | `BAD_ARGS` | The inputs don't make sense (bad amount, unknown option). |
-| `THRESHOLD_UNAVAILABLE` | Reserved for threshold signing; not used in Phase 0. |
+| `THRESHOLD_UNAVAILABLE` | A threshold bot's signing didn't complete: the co-signer couldn't be reached, the protocol failed, or the co-signer has banned this bot after detecting cheating. |
+| `POLICY_MISMATCH` | A threshold bot's co-signer holds a different signed policy than the connector (for example, mid-reload). Try again shortly. |
 | `INTERNAL` | A server error. |
