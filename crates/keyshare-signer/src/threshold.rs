@@ -453,6 +453,11 @@ impl LocalCoSigner {
         self.lock().policy = Some(policy);
     }
 
+    /// Drops the policy, so the co-signer refuses everything (for a bot the new policy no longer has).
+    pub fn clear_policy(&self) {
+        self.lock().policy = None;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, CoState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

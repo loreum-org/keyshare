@@ -196,6 +196,25 @@ impl Executor {
         let hl_policies = set.hyperliquid()?;
         let reference = loaded.reference;
         let signer = loaded.signer;
+        // Build every co-signer's policy before anything switches, so a failure here leaves the
+        // whole server on the old policy rather than half-applied.
+        let mut cosigner_policies = Vec::new();
+        for (bot, (co, admins)) in &self.cosigners {
+            let policy = match set.bots.get(bot) {
+                Some(rules) => {
+                    let own = self.wallet.lock().unwrap_or_else(|e| e.into_inner()).address(bot).ok();
+                    Some(CoSignerPolicy {
+                        bot: bot.clone(),
+                        policy: reference,
+                        engine: Box::new(PlainPolicy { own_address: own, ..rules.core.clone() }),
+                        prices: Box::new(set.price_table()?),
+                        admins: admins.clone(),
+                    })
+                }
+                None => None,
+            };
+            cosigner_policies.push((co.clone(), policy));
+        }
         let for_wallet = set.clone();
         self.with_wallet(move |w| {
             let mut engines: HashMap<String, Box<dyn PolicyEngine>> = HashMap::new();
@@ -208,16 +227,11 @@ impl Executor {
             w.apply_policy(reference, engines, Box::new(prices), detail, now())
         })
         .await??;
-        for (bot, (co, admins)) in &self.cosigners {
-            let Some(rules) = set.bots.get(bot) else { continue };
-            let own = self.wallet.lock().unwrap_or_else(|e| e.into_inner()).address(bot).ok();
-            co.set_policy(CoSignerPolicy {
-                bot: bot.clone(),
-                policy: reference,
-                engine: Box::new(PlainPolicy { own_address: own, ..rules.core.clone() }),
-                prices: Box::new(set.price_table()?),
-                admins: admins.clone(),
-            });
+        for (co, policy) in cosigner_policies {
+            match policy {
+                Some(p) => co.set_policy(p),
+                None => co.clear_policy(),
+            }
         }
         if let Some(hl) = &self.hl {
             hl.set_policies(hl_policies);

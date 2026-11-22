@@ -141,7 +141,7 @@ co-signer share: {}
 In the config:
   [bots.<name>.threshold]
   share = \"{}\"
-  cosigner_share = \"{}\"",
+  cosigner_share = \"{}\"\n\nBack up each share separately. Keeping both in one place (or one backup) is the same as\nkeeping the full key.",
         share.address(),
         a.display(),
         b.display(),
