@@ -14,6 +14,7 @@ These docs cover what is built today (Phase 0). The long-term design, including 
 | [Owner approvals](owner-approvals.md) | How over-limit requests wait for the owner, and how the owner approves or denies them |
 | [Swaps](swaps.md) | Uniswap v3 swaps and their safety checks |
 | [Hyperliquid](hyperliquid.md) | Trading on Hyperliquid testnet with agent keys and trading limits |
+| [Protocol modules](modules.md) | How Hyperliquid and Uniswap sit outside the core, and how to add a module |
 | [Safety and state](safety.md) | The kill switch, the spend log, the audit log, and known gaps before mainnet |
 | [Code layout](code.md) | Where things live in the source, for developers |
 | [Design](design.md) | The full long-term design (v0.1) |

@@ -222,6 +222,10 @@ impl KeyshareServer {
         self.exec.with_wallet(f).await.map_err(internal)
     }
 
+    fn module_hidden(&self, caller: &str, tool: &str) -> bool {
+        self.exec.hidden_tools(caller).contains(&tool)
+    }
+
     fn hl(&self) -> Result<&Hyperliquid, CallToolResult> {
         self.exec
             .hl
@@ -275,8 +279,9 @@ impl KeyshareServer {
             Ok(v) => v,
             Err(r) => return Ok(refused("", r)),
         };
-        if let Some(hl) = self.exec.hl.as_deref()
-            && let Some(floor) = hl.floor_for_limits(&self.exec, &bot).await
+        if !self.module_hidden(&bot, "hl_positions")
+            && let Some(hl) = self.exec.hl.as_deref()
+            && let Some(floor) = hl.floor_for_limits(&*self.exec, &bot).await
         {
             v["hyperliquid"] = floor;
         }
@@ -424,6 +429,9 @@ impl KeyshareServer {
         Parameters(args): Parameters<SwapArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "swap") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let id = new_request_id(args.request_id);
         let req = SwapRequest {
             chain_id: args.chain_id,
@@ -434,7 +442,7 @@ impl KeyshareServer {
             route_provider: args.route_provider,
             dry_run: args.dry_run,
         };
-        swap::swap(&self.exec, &caller, &id, req).await.map(to_result).map_err(internal)
+        swap::swap(&*self.exec, &caller, &id, req).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -514,11 +522,14 @@ impl KeyshareServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "hl_positions") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let hl = match self.hl() {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
-        Ok(to_result(hl.positions(&self.exec, &caller).await))
+        Ok(to_result(hl.positions(&*self.exec, &caller).await))
     }
 
     #[tool(
@@ -530,12 +541,15 @@ impl KeyshareServer {
         Parameters(args): Parameters<HlOrderArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "hl_place_order") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let hl = match self.hl() {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.place_order(&self.exec, &caller, &id, args.order).await.map(to_result).map_err(internal)
+        hl.place_order(&*self.exec, &caller, &id, args.order).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -547,12 +561,15 @@ impl KeyshareServer {
         Parameters(args): Parameters<HlModifyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "hl_modify") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let hl = match self.hl() {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.modify(&self.exec, &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
+        hl.modify(&*self.exec, &caller, &id, args.oid, args.order).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -564,12 +581,15 @@ impl KeyshareServer {
         Parameters(args): Parameters<HlCancelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "hl_cancel") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let hl = match self.hl() {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.cancel(&self.exec, &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
+        hl.cancel(&*self.exec, &caller, &id, &args.coin, args.oid).await.map(to_result).map_err(internal)
     }
 
     #[tool(
@@ -581,12 +601,15 @@ impl KeyshareServer {
         Parameters(args): Parameters<HlLeverageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
+        if self.module_hidden(&caller, "hl_set_leverage") {
+            return Err(ErrorData::invalid_params("tool not found", None));
+        }
         let hl = match self.hl() {
             Ok(h) => h,
             Err(e) => return Ok(e),
         };
         let id = new_request_id(args.request_id);
-        hl.set_leverage(&self.exec, &caller, &id, &args.coin, args.leverage, args.is_cross)
+        hl.set_leverage(&*self.exec, &caller, &id, &args.coin, args.leverage, args.is_cross)
             .await
             .map(to_result)
             .map_err(internal)
@@ -595,6 +618,30 @@ impl KeyshareServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KeyshareServer {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let supports_cache_hints =
+            context.protocol_version().is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut tools = self.tool_router.list_all();
+        if let Some(parts) = context.extensions.get::<http::request::Parts>()
+            && let Some(caller) = parts.extensions.get::<crate::auth::Caller>()
+        {
+            let hidden = self.exec.hidden_tools(&caller.0);
+            tools.retain(|tool| !hidden.iter().any(|name| tool.name.as_ref() == *name));
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "keyshare wallet. Every signature is checked against this bot's policy and logged. \

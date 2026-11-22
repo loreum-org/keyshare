@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 keyshare-core = { path = "../keyshare-core" }
+keyshare-hyperliquid = { path = "../keyshare-hyperliquid" }
+keyshare-module = { path = "../keyshare-module" }
+keyshare-uniswap = { path = "../keyshare-uniswap" }
 alloy = { workspace = true, features = ["provider-http", "reqwest-rustls-tls", "rpc-types", "network"] }
 axum = "0.8"
 http = "1"

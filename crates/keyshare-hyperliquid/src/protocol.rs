@@ -11,8 +11,8 @@ use alloy::primitives::{Address, B256, Signature, keccak256};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::price::UsdMicros;
-use crate::refusal::{Refusal, RefusalCode};
+use keyshare_core::price::UsdMicros;
+use keyshare_core::refusal::{Refusal, RefusalCode};
 
 /// Hyperliquid's L1 signing domain uses this chain id whatever chain the wallet is on.
 const L1_CHAIN_ID: u64 = 1337;
@@ -452,13 +452,62 @@ impl HlPolicy {
         }
         Ok(())
     }
+
+    /// Core re-check of the wire action, independent of the figures the module gathered from the
+    /// venue. Reduce-only orders still skip the size cap: the wire flag is what is signed.
+    pub fn vet_action(&self, action: &L1Action, coin: &str) -> Result<(), Refusal> {
+        match action {
+            L1Action::Order { orders, .. } => {
+                self.check_market(coin)?;
+                for order in orders {
+                    self.vet_wire_order(order)?;
+                }
+                Ok(())
+            }
+            L1Action::Modify { modifies, .. } => {
+                self.check_market(coin)?;
+                for modify in modifies {
+                    self.vet_wire_order(&modify.order)?;
+                }
+                Ok(())
+            }
+            L1Action::Cancel { .. } => self.check_market(coin),
+            L1Action::UpdateLeverage { leverage, .. } => self.check_leverage(coin, *leverage),
+        }
+    }
+
+    fn vet_wire_order(&self, order: &OrderWire) -> Result<(), Refusal> {
+        if order.r {
+            return Ok(());
+        }
+        let sz = parse_e8(&order.s).map_err(|e| Refusal::new(RefusalCode::BadArgs, e))?;
+        let px = parse_e8(&order.p).map_err(|e| Refusal::new(RefusalCode::BadArgs, e))?;
+        let notion = notional_usd(sz, px);
+        if notion > usd_micros(self.max_order_usd) {
+            return Err(Refusal::new(
+                RefusalCode::OrderTooLarge,
+                format!("order is ${}, over the ${} per-order cap", usd_str(notion), self.max_order_usd),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Asset index carried by an L1 action, when it has one.
+pub fn action_asset(action: &L1Action) -> Option<u32> {
+    match action {
+        L1Action::Order { orders, .. } => orders.first().map(|o| o.a),
+        L1Action::Cancel { cancels, .. } => cancels.first().map(|c| c.a),
+        L1Action::Modify { modifies, .. } => modifies.first().map(|m| m.order.a),
+        L1Action::UpdateLeverage { asset, .. } => Some(*asset),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{LocalSigner, Signer};
+    use keyshare_core::{LocalSigner, Signer};
 
     /// The SDK's test key.
     const KEY: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";

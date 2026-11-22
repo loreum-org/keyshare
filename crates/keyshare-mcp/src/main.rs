@@ -65,7 +65,10 @@ async fn serve(path: PathBuf) -> Result<()> {
     let tokens = Arc::new(config.prices.clone());
     let hold = config.server.hold_secs.unwrap_or(DEFAULT_HOLD_SECS);
     let hl = config.hyperliquid()?;
-    let exec = Arc::new(Executor::new(Arc::new(Mutex::new(wallet)), chains, tokens, hold).with_hyperliquid(hl));
+    let modules = config.bots.iter().map(|(bot, cfg)| (bot.clone(), cfg.modules.clone())).collect();
+    let exec = Arc::new(
+        Executor::new(Arc::new(Mutex::new(wallet)), chains, tokens, hold).with_hyperliquid(hl).with_modules(modules),
+    );
     let port = std::env::var("PORT").ok();
     let listen = config.server.bind_addr(port.as_deref())?;
     let extra_hosts = std::env::var("KEYSHARE_ALLOWED_HOSTS").ok();

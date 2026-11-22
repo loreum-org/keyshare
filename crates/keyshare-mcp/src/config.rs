@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256};
-use keyshare_core::hyperliquid::HlPolicy;
 use keyshare_core::price::PriceEntry;
 use keyshare_core::{Account, LocalSigner, PlainPolicy, PriceTable, Signer, StatePaths, Wallet};
+use keyshare_hyperliquid::HlPolicy;
 use serde::Deserialize;
 
 use crate::chain::ChainConfig;
@@ -102,6 +102,30 @@ pub struct BotConfig {
     pub policy: PlainPolicy,
     /// Hyperliquid testnet guardrails. Without this table the `hl_*` tools refuse this bot.
     pub hyperliquid: Option<HlPolicy>,
+    /// Which protocol modules this bot is offered. Omitted means every module stays available,
+    /// which is how the tools behaved before modules could be switched off.
+    #[serde(default)]
+    pub modules: ModuleToggles,
+}
+
+/// Per-bot module switches. `false` removes that module's tools from `tools/list` and rejects calls.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleToggles {
+    #[serde(default = "module_on")]
+    pub hyperliquid: bool,
+    #[serde(default = "module_on")]
+    pub uniswap: bool,
+}
+
+fn module_on() -> bool {
+    true
+}
+
+impl Default for ModuleToggles {
+    fn default() -> Self {
+        Self { hyperliquid: true, uniswap: true }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

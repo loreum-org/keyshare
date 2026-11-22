@@ -3,19 +3,23 @@
 //! admin approval instead (§13.2). Shared by the MCP tools and the admin endpoints.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::TxEip1559;
-use alloy::primitives::{B256, Signature};
+use alloy::primitives::{Address, B256, Signature};
 use keyshare_core::approval::{self, Decision};
 use keyshare_core::audit::AuditEvent;
+use keyshare_core::policy::TypedDataRule;
 use keyshare_core::price::{MICROS_PER_USD, PriceEntry};
-use keyshare_core::{Action, Refusal, RefusalCode, Wallet};
+use keyshare_core::{Action, Refusal, RefusalCode, Signer, Wallet};
+use keyshare_module::{Grant, authorize_typed};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
+use crate::config::ModuleToggles;
 use crate::hl::Hyperliquid;
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
@@ -74,6 +78,8 @@ pub struct Executor {
     pub chains: Arc<Chains>,
     pub tokens: Arc<Vec<PriceEntry>>,
     pub hl: Option<Arc<Hyperliquid>>,
+    /// Per-bot module switches. A bot with no entry is offered every module.
+    pub modules: HashMap<String, ModuleToggles>,
     /// Held from nonce lookup to broadcast so two sends never get the same nonce.
     send_lock: tokio::sync::Mutex<()>,
     /// Keyed by the caller-scoped request id. In memory: a restart drops held requests, which
@@ -111,6 +117,7 @@ impl Executor {
             chains,
             tokens,
             hl: None,
+            modules: HashMap::new(),
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
@@ -120,6 +127,24 @@ impl Executor {
     pub fn with_hyperliquid(mut self, hl: Hyperliquid) -> Self {
         self.hl = Some(Arc::new(hl));
         self
+    }
+
+    pub fn with_modules(mut self, modules: HashMap<String, ModuleToggles>) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// Tool names this bot should not see. An unknown bot, or a bot with no switches, hides nothing.
+    pub fn hidden_tools(&self, bot: &str) -> Vec<&'static str> {
+        let Some(toggles) = self.modules.get(bot) else { return Vec::new() };
+        let mut hidden = Vec::new();
+        if !toggles.hyperliquid {
+            hidden.extend(keyshare_hyperliquid::client::HYPERLIQUID_TOOLS);
+        }
+        if !toggles.uniswap {
+            hidden.extend(keyshare_uniswap::UNISWAP_TOOLS);
+        }
+        hidden
     }
 
     /// Runs `f` on the wallet off the async runtime (it does fsyncs).
@@ -460,5 +485,98 @@ impl Executor {
                 Ok(out)
             }
         }
+    }
+}
+
+fn hyperliquid_grant() -> Grant {
+    Grant {
+        id: "hyperliquid",
+        calls: vec![],
+        approve_spenders: vec![],
+        typed_data: vec![TypedDataRule {
+            primary_type: "Agent".into(),
+            verifying_contract: Some(Address::ZERO),
+            name: Some("Exchange".into()),
+            chain_id: Some(1337),
+            chainless: false,
+        }],
+    }
+}
+
+impl keyshare_hyperliquid::HlHost for Executor {
+    fn with_wallet<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
+    ) -> impl Future<Output = Result<T, String>> + Send {
+        Executor::with_wallet(self, f)
+    }
+
+    async fn sign_l1(
+        &self,
+        bot: &str,
+        coin: &str,
+        action: &keyshare_hyperliquid::L1Action,
+        nonce: u64,
+    ) -> Result<Signature, Refusal> {
+        let hl = self
+            .hl
+            .as_deref()
+            .ok_or_else(|| Refusal::new(RefusalCode::MarketNotAllowed, "Hyperliquid is not configured"))?;
+        let policy = hl.policy(bot)?;
+        if let Some(index) = keyshare_hyperliquid::action_asset(action)
+            && let Some(name) = hl.coin_for_index(index).await
+            && name != coin
+        {
+            return Err(Refusal::new(
+                RefusalCode::MarketNotAllowed,
+                format!("asset index {index} is {name}, not {coin}"),
+            ));
+        }
+        policy.vet_action(action, coin)?;
+        let hash = keyshare_hyperliquid::action_hash(action, None, nonce, None)
+            .map_err(|e| Refusal::new(RefusalCode::BadArgs, e))?;
+        // Phase 0 signs for testnet only, matching the module's posted actions.
+        let typed = keyshare_hyperliquid::l1_typed_data(hash, false);
+        authorize_typed(&hyperliquid_grant(), &typed)?;
+        let agent = hl.open_agent(bot)?;
+        agent.sign_typed_data(&typed).map_err(|e| Refusal::new(RefusalCode::ThresholdUnavailable, e.to_string()))
+    }
+}
+
+impl keyshare_uniswap::SwapHost for Executor {
+    fn provider(&self, chain_id: u64) -> Result<&alloy::providers::RootProvider, Refusal> {
+        self.chains.get(chain_id)
+    }
+
+    fn uniswap(&self, chain_id: u64) -> Result<&keyshare_uniswap::UniswapV3, Refusal> {
+        self.chains.uniswap(chain_id)
+    }
+
+    async fn token_decimals(&self, chain_id: u64, token: alloy::primitives::Address) -> Result<u8, Refusal> {
+        let provider = self.chains.get(chain_id)?;
+        chain::token_decimals(provider, token).await
+    }
+
+    async fn tx_state(&self, chain_id: u64, hash: B256) -> Result<String, Refusal> {
+        let provider = self.chains.get(chain_id)?;
+        Ok(chain::tx_status(provider, hash).await?.state.to_string())
+    }
+
+    fn with_wallet<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Wallet) -> T + Send + 'static,
+    ) -> impl Future<Output = Result<T, String>> + Send {
+        Executor::with_wallet(self, f)
+    }
+
+    async fn submit(&self, caller: &str, id: &str, tx: TxEip1559, dry_run: bool) -> Result<Outcome, String> {
+        let router = match self.chains.uniswap(tx.chain_id) {
+            Ok(dex) => dex.router,
+            Err(r) => return Ok(Err(refusal(id, &r))),
+        };
+        if let Err(r) = keyshare_uniswap::grant(router).covers_tx(&tx) {
+            return Ok(Err(refusal(id, &r)));
+        }
+        Executor::submit(self, caller, id, tx, dry_run).await
     }
 }

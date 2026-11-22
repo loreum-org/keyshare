@@ -3196,11 +3196,26 @@ name = "keyshare-core"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
+name = "keyshare-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "reqwest 0.13.5",
+ "rmcp",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "toml",
 ]
 
@@ -3212,6 +3227,9 @@ dependencies = [
  "axum",
  "http 1.5.0",
  "keyshare-core",
+ "keyshare-hyperliquid",
+ "keyshare-module",
+ "keyshare-uniswap",
  "reqwest 0.13.5",
  "rmcp",
  "serde",
@@ -3222,6 +3240,27 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+]
+
+[[package]]
+name = "keyshare-module"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "serde_json",
+]
+
+[[package]]
+name = "keyshare-uniswap"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "keyshare-core",
+ "keyshare-module",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
