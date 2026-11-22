@@ -7,15 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::TxEip1559;
-use alloy::primitives::{B256, Signature};
+use alloy::primitives::{Address, B256, Signature};
 use keyshare_core::approval::{self, Decision};
 use keyshare_core::audit::AuditEvent;
-use keyshare_core::price::{MICROS_PER_USD, PriceEntry};
-use keyshare_core::{Action, Refusal, RefusalCode, Wallet};
+use keyshare_core::policy::{TypedDataRule, Verdict};
+use keyshare_core::price::{MICROS_PER_USD, PriceEntry, UsdMicros};
+use keyshare_core::{Action, Refusal, RefusalCode, Signer, Wallet};
+use keyshare_module::{Grant, ModuleView, authorize_typed};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::chain::{self, Chains};
+use crate::config::ModuleToggles;
 use crate::hl::Hyperliquid;
 
 /// How long a held request waits for the owner (design §13.2 step 5, estimate).
@@ -74,6 +77,8 @@ pub struct Executor {
     pub chains: Arc<Chains>,
     pub tokens: Arc<Vec<PriceEntry>>,
     pub hl: Option<Arc<Hyperliquid>>,
+    /// Per-bot module switches. A bot with no entry is offered every module.
+    pub modules: HashMap<String, ModuleToggles>,
     /// Held from nonce lookup to broadcast so two sends never get the same nonce.
     send_lock: tokio::sync::Mutex<()>,
     /// Keyed by the caller-scoped request id. In memory: a restart drops held requests, which
@@ -111,6 +116,7 @@ impl Executor {
             chains,
             tokens,
             hl: None,
+            modules: HashMap::new(),
             send_lock: tokio::sync::Mutex::new(()),
             requests: Mutex::new(HashMap::new()),
             hold_secs,
@@ -120,6 +126,24 @@ impl Executor {
     pub fn with_hyperliquid(mut self, hl: Hyperliquid) -> Self {
         self.hl = Some(Arc::new(hl));
         self
+    }
+
+    pub fn with_modules(mut self, modules: HashMap<String, ModuleToggles>) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    /// Tool names this bot should not see. An unknown bot, or a bot with no switches, hides nothing.
+    pub fn hidden_tools(&self, bot: &str) -> Vec<&'static str> {
+        let Some(toggles) = self.modules.get(bot) else { return Vec::new() };
+        let mut hidden = Vec::new();
+        if !toggles.hyperliquid {
+            hidden.extend(keyshare_hyperliquid::client::HYPERLIQUID_TOOLS);
+        }
+        if !toggles.uniswap {
+            hidden.extend(keyshare_uniswap::UNISWAP_TOOLS);
+        }
+        hidden
     }
 
     /// Runs `f` on the wallet off the async runtime (it does fsyncs).
@@ -460,5 +484,151 @@ impl Executor {
                 Ok(out)
             }
         }
+    }
+}
+
+fn hyperliquid_grant() -> Grant {
+    Grant {
+        id: "hyperliquid",
+        calls: vec![],
+        approve_spenders: vec![],
+        typed_data: vec![TypedDataRule {
+            primary_type: "Agent".into(),
+            verifying_contract: Some(Address::ZERO),
+            name: Some("Exchange".into()),
+            chain_id: Some(1337),
+            chainless: false,
+        }],
+    }
+}
+
+fn host_err(e: String) -> Refusal {
+    Refusal::new(RefusalCode::Internal, e)
+}
+
+impl ModuleView for Executor {
+    async fn address(&self, caller: &str) -> Result<Address, Refusal> {
+        let caller = caller.to_string();
+        self.with_wallet(move |w| w.address(&caller)).await.map_err(host_err)?
+    }
+
+    async fn limits(&self, caller: &str) -> Result<keyshare_core::policy::Limits, Refusal> {
+        let caller = caller.to_string();
+        self.with_wallet(move |w| w.limits(&caller)).await.map_err(host_err)?
+    }
+
+    async fn spent_24h(&self, caller: &str, now: u64) -> Result<UsdMicros, Refusal> {
+        let caller = caller.to_string();
+        self.with_wallet(move |w| w.spent_24h(&caller, now)).await.map_err(host_err)
+    }
+
+    async fn check_kill_switch(&self, caller: &str) -> Result<(), Refusal> {
+        let caller = caller.to_string();
+        self.with_wallet(move |w| w.kill_switch().check(&caller)).await.map_err(host_err)?
+    }
+
+    async fn preview_tx(&self, caller: &str, tx: TxEip1559, now: u64) -> Result<Verdict, Refusal> {
+        let caller = caller.to_string();
+        self.with_wallet(move |w| w.preview(&caller, Action::Transaction(&tx), now)).await.map_err(host_err)?
+    }
+
+    async fn log_event(
+        &self,
+        caller: &str,
+        request_id: &str,
+        event: AuditEvent,
+        detail: Value,
+        now: u64,
+    ) -> Result<(), String> {
+        let caller = caller.to_string();
+        let request_id = request_id.to_string();
+        self.with_wallet(move |w| w.log_event(&caller, &request_id, event, detail, now)).await
+    }
+
+    async fn log_refusal(
+        &self,
+        caller: &str,
+        request_id: &str,
+        detail: Value,
+        refusal: &Refusal,
+        now: u64,
+    ) -> Result<(), String> {
+        let caller = caller.to_string();
+        let request_id = request_id.to_string();
+        let refusal = refusal.clone();
+        self.with_wallet(move |w| w.log_refusal(&caller, &request_id, detail, &refusal, now)).await
+    }
+}
+
+impl keyshare_hyperliquid::HlHost for Executor {
+    async fn sign_l1(
+        &self,
+        bot: &str,
+        coin: &str,
+        action: &keyshare_hyperliquid::L1Action,
+        nonce: u64,
+    ) -> Result<Signature, Refusal> {
+        let hl = self
+            .hl
+            .as_deref()
+            .ok_or_else(|| Refusal::new(RefusalCode::MarketNotAllowed, "Hyperliquid is not configured"))?;
+        let policy = hl.policy(bot)?;
+        let indexes = keyshare_hyperliquid::action_assets(action);
+        if indexes.is_empty() {
+            return Err(Refusal::new(RefusalCode::BadArgs, "action names no asset"));
+        }
+        for index in indexes {
+            let Some(name) = hl.coin_for_index(index).await else {
+                return Err(Refusal::new(
+                    RefusalCode::MarketNotAllowed,
+                    format!("asset index {index} is not in the loaded market list"),
+                ));
+            };
+            if name != coin {
+                return Err(Refusal::new(
+                    RefusalCode::MarketNotAllowed,
+                    format!("asset index {index} is {name}, not {coin}"),
+                ));
+            }
+        }
+        policy.vet_action(action, coin)?;
+        let hash = keyshare_hyperliquid::action_hash(action, None, nonce, None)
+            .map_err(|e| Refusal::new(RefusalCode::BadArgs, e))?;
+        // Phase 0 signs for testnet only, matching the module's posted actions.
+        let typed = keyshare_hyperliquid::l1_typed_data(hash, false);
+        authorize_typed(&hyperliquid_grant(), &typed)?;
+        let agent = crate::hl::open_agent(hl, bot)?;
+        agent.sign_typed_data(&typed).map_err(|e| Refusal::new(RefusalCode::ThresholdUnavailable, e.to_string()))
+    }
+}
+
+impl keyshare_uniswap::SwapHost for Executor {
+    fn provider(&self, chain_id: u64) -> Result<&alloy::providers::RootProvider, Refusal> {
+        self.chains.get(chain_id)
+    }
+
+    fn uniswap(&self, chain_id: u64) -> Result<&keyshare_uniswap::UniswapV3, Refusal> {
+        self.chains.uniswap(chain_id)
+    }
+
+    async fn token_decimals(&self, chain_id: u64, token: alloy::primitives::Address) -> Result<u8, Refusal> {
+        let provider = self.chains.get(chain_id)?;
+        chain::token_decimals(provider, token).await
+    }
+
+    async fn tx_state(&self, chain_id: u64, hash: B256) -> Result<String, Refusal> {
+        let provider = self.chains.get(chain_id)?;
+        Ok(chain::tx_status(provider, hash).await?.state.to_string())
+    }
+
+    async fn submit(&self, caller: &str, id: &str, tx: TxEip1559, dry_run: bool) -> Result<Outcome, String> {
+        let router = match self.chains.uniswap(tx.chain_id) {
+            Ok(dex) => dex.router,
+            Err(r) => return Ok(Err(refusal(id, &r))),
+        };
+        if let Err(r) = keyshare_uniswap::grant(router).covers_tx(&tx) {
+            return Ok(Err(refusal(id, &r)));
+        }
+        Executor::submit(self, caller, id, tx, dry_run).await
     }
 }

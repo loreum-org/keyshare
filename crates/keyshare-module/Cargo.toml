@@ -1,0 +1,16 @@
+[package]
+name = "keyshare-module"
+description = "Protocol module interface. Modules propose intents; only the core signs them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloy.workspace = true
+keyshare-core = { path = "../keyshare-core" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

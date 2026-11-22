@@ -16,8 +16,11 @@ Documentation of what is built: [docs/README.md](docs/README.md). Full design: [
 
 | Crate | What it does |
 |---|---|
-| `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path that ties them together. |
-| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `balances`, `simulate`, `send`, `swap` (Uniswap v3), `call_contract`, `tx_status`, `sign_message`, `sign_typed_data`. Over-limit requests wait for the owner's signed approval at `/admin/decide`. Hyperliquid testnet: `hl_place_order`, `hl_modify`, `hl_cancel`, `hl_set_leverage`, `hl_positions`, signed by a short-lived agent key and checked against the bot's markets, size caps, leverage cap, daily loss stop and optional equity floor. |
+| `crates/keyshare-core` | Signer trait (single testnet key now, 2-of-3 later), per-bot policy, spend counter, audit log, kill switch, and the signing path. No venue code. |
+| `crates/keyshare-module` | Intents and grants. The core re-checks every module intent before it signs. |
+| `crates/keyshare-hyperliquid` | Hyperliquid testnet orders. The core signs them with the bot's agent key. |
+| `crates/keyshare-uniswap` | Uniswap v3 swaps. The core signs the approve and the swap. |
+| `crates/keyshare-mcp` | MCP connector over streamable HTTP. Bots log in with a bearer token. Tools: `address`, `limits`, `balances`, `simulate`, `send`, `swap` (Uniswap v3), `call_contract`, `tx_status`, `sign_message`, `sign_typed_data`. Over-limit requests wait for the owner's signed approval at `/admin/decide`. Hyperliquid testnet: `hl_place_order`, `hl_modify`, `hl_cancel`, `hl_set_leverage`, `hl_positions`, signed by a short-lived agent key and checked against the bot's markets, size caps, leverage cap, daily loss stop and optional equity floor. A bot can hide either module under `[bots.<name>.modules]`. |
 
 ```sh
 cargo test

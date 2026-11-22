@@ -84,6 +84,11 @@ chains = [11155111]
 # Only exactInputSingle is checked against prices. Don't allowlist the router's other
 # selectors (exactInput, exactOutputSingle, multicall): they would skip that check.
 
+# Hide a protocol module from this bot. Omitted means both stay available.
+# [bots.filltape.modules]
+# hyperliquid = false
+# uniswap = false
+
 # Hyperliquid testnet trading. The bot's wallet key is the master account; orders are signed by an
 # agent key from `keyshare-mcp hl-approve-agent`, which can't withdraw. Reduce-only orders skip
 # the size caps, the loss stop and the equity floor. Keyshare does not flatten a breached account.

@@ -4,7 +4,6 @@
 pub mod approval;
 pub mod audit;
 pub mod chainlog;
-pub mod hyperliquid;
 pub mod killswitch;
 pub mod policy;
 pub mod price;

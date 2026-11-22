@@ -125,7 +125,8 @@ pub struct TypedDataRule {
 }
 
 impl TypedDataRule {
-    fn matches(&self, data: &TypedData) -> bool {
+    /// Whether this rule names `data`'s primary type and domain.
+    pub fn matches(&self, data: &TypedData) -> bool {
         let d = &data.domain;
         let bound = self.verifying_contract.is_some() || (self.name.is_some() && d.chain_id.is_none());
         let chain_ok = match (d.chain_id, self.chain_id) {
@@ -143,6 +144,11 @@ impl TypedDataRule {
 
 /// Typed data that moves funds: never signed as raw typed data, because the policy can't value
 /// it against the caps. Hyperliquid user-signed actions go through the `hl_*` tools instead.
+/// Module intents hit the same refusal in `keyshare_module::authorize_typed`.
+pub fn refuses_raw_typed_data(primary_type: &str) -> bool {
+    moves_funds(primary_type)
+}
+
 fn moves_funds(primary_type: &str) -> bool {
     primary_type.starts_with("HyperliquidTransaction:")
         || matches!(

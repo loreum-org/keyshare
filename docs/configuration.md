@@ -97,6 +97,15 @@ The bot's spending rules. [Policy](policy.md) explains how each is applied.
 | `chain_id` | Required chain. Default: any of the bot's chains. |
 | `chainless` | Set to `true` to allow domains that have no chain id. |
 
+## `[bots.<name>.modules]`
+
+Which protocol modules this bot is offered. Leave the section out to offer every module. See [Protocol modules](modules.md).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `hyperliquid` | `true` | `false` removes the `hl_*` tools from this bot's tool list. |
+| `uniswap` | `true` | `false` removes the `swap` tool from this bot's tool list. |
+
 ## `[bots.<name>.hyperliquid]`
 
 Without this section the bot can't use the Hyperliquid tools. [Hyperliquid](hyperliquid.md) explains each limit.

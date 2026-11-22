@@ -14,6 +14,8 @@ use alloy::transports::TransportError;
 use keyshare_core::{Refusal, RefusalCode};
 use serde::{Deserialize, Serialize};
 
+pub use keyshare_uniswap::UniswapV3;
+
 sol! {
     function decimals() returns (uint8);
     function balanceOf(address owner) returns (uint256);
@@ -26,22 +28,6 @@ pub struct ChainConfig {
     pub rpc_url: String,
     /// Uniswap v3 contracts for the `swap` tool. Without them `swap` refuses this chain.
     pub uniswap_v3: Option<UniswapV3>,
-}
-
-/// SwapRouter02, QuoterV2 and the wrapped native token on one chain.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UniswapV3 {
-    pub router: Address,
-    pub quoter: Address,
-    pub weth: Address,
-    /// Pool fee tiers to quote, in hundredths of a bip. Default 500, 3000, 10000.
-    #[serde(default = "default_fee_tiers")]
-    pub fee_tiers: Vec<u32>,
-}
-
-fn default_fee_tiers() -> Vec<u32> {
-    vec![500, 3000, 10000]
 }
 
 pub struct Chains {
