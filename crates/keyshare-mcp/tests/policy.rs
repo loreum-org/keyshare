@@ -263,3 +263,25 @@ fn migrate_round_trips_the_example_shape() {
     set.check_bots(&config).unwrap();
     let _: HashMap<_, _> = set.modules();
 }
+
+#[tokio::test]
+async fn unrecorded_version_does_not_take_over() {
+    let f = Fixture::new(100);
+    let config = f.config();
+    let exec = f.build().await.unwrap();
+    let before = exec.active_policy().unwrap().reference;
+
+    // The version record can't be written (a directory sits where the temp file goes).
+    std::fs::create_dir_all(f.dir.path().join("state/policy.state.tmp/x")).unwrap();
+    f.sign(&with_version(&with_cap(&f.policy_text(), 200), 2));
+    assert!(matches!(exec.reload_policy(&config).await, Reload::Rejected(_)));
+    // Nothing switched: the wallet still stamps and enforces the old policy.
+    assert_eq!(exec.wallet().lock().unwrap().policy_ref(), Some(before));
+    assert_eq!(exec.active_policy().unwrap().reference, before);
+    let r = exec.wallet().lock().unwrap().sign_transaction("bot", "a", send(75, 0), 1_800_000_000).unwrap_err();
+    assert_eq!(r.code, RefusalCode::PerTxCapExceeded);
+
+    // Once the record can be written, the next reload loads it.
+    std::fs::remove_dir_all(f.dir.path().join("state/policy.state.tmp")).unwrap();
+    assert!(matches!(exec.reload_policy(&config).await, Reload::Loaded(_)));
+}

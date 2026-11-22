@@ -31,6 +31,22 @@ fi
 
 # The signed policy can come from variables too. Written to the volume, where the
 # Railway config reads it; a later file on the volume replaces it until the next start.
+# A newer version already on the volume (hot-loaded since) is kept: writing the older
+# variable back would be refused as a rollback and the server would not start.
+policy_version() {
+  # Top-level `version = N`, before the first [table].
+  awk '/^[[:space:]]*\[/ { exit } /^[[:space:]]*version[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); if (match($0, /^[0-9]+/)) print substr($0, 1, RLENGTH); exit }' "$1" 2>/dev/null
+}
+if [ -n "${KEYSHARE_POLICY:-}" ] && [ -f /data/policy.toml ]; then
+  printf '%s\n' "$KEYSHARE_POLICY" > /data/policy.env.tmp
+  on_volume=$(policy_version /data/policy.toml)
+  from_env=$(policy_version /data/policy.env.tmp)
+  rm -f /data/policy.env.tmp
+  if [ -n "$on_volume" ] && [ -n "$from_env" ] && [ "$on_volume" -gt "$from_env" ]; then
+    echo "keeping policy version $on_volume on /data; KEYSHARE_POLICY has older version $from_env" >&2
+    unset KEYSHARE_POLICY KEYSHARE_POLICY_SIG
+  fi
+fi
 if [ -n "${KEYSHARE_POLICY:-}" ]; then
   printf '%s\n' "$KEYSHARE_POLICY" > /data/policy.toml.tmp
   mv -f /data/policy.toml.tmp /data/policy.toml

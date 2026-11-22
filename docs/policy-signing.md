@@ -67,9 +67,11 @@ The newest accepted version and hash are kept in `policy.state.json` in the stat
 
 To go back to older rules, sign them again under a new, higher version number. That is an explicit owner decision, recorded like any other version.
 
+The signed message doesn't name a server. A policy signed for one server (say, a test server with looser caps) is also valid on any other server that lists the same signer and hasn't yet loaded a higher version. Use a different signer key per deployment, or keep version numbers ahead on production, until the message gains an instance line.
+
 ## Hot reload
 
-The server checks the policy file every `policy_reload_secs` (default 5). When the contents change, it runs every check above. A valid newer version takes over at once: core rules, prices, Hyperliquid limits and module switches. It logs `PolicyLoaded` with the version, hash and signer. A file that fails any check is logged once as `PolicyRejected`, and the policy already in force stays. Nothing needs a restart.
+The server checks the policy file every `policy_reload_secs` (default 5). When the contents change, it runs every check above. A valid newer version takes over at once: core rules, prices, Hyperliquid limits (including a `[hyperliquid]` section added to a bot that had none) and module switches. The version is recorded before anything switches, so if the record can't be written the old policy stays in force everywhere. It logs `PolicyLoaded` with the version, hash and signer. A file that fails any check is logged once as `PolicyRejected`, and the policy already in force stays. Nothing needs a restart.
 
 ## In the audit log
 
